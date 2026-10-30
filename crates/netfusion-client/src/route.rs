@@ -128,6 +128,7 @@ impl RouteManager {
 
     /// Clean up all bypass routes on shutdown
     pub fn cleanup(&mut self) {
+        purge_conflicting_kernel_routes();
         for route in self.added_routes.drain(..) {
             info!(
                 "Removing bypass route {} via if_index {}",
@@ -147,6 +148,43 @@ impl RouteManager {
                 .creation_flags(CREATE_NO_WINDOW)
                 .output();
         }
+    }
+}
+
+/// Enable Weak Host Model on interface to allow sending & receiving through multiple WAN adapters
+pub fn enable_weak_host_model(if_index: u32) {
+    let _ = Command::new("netsh")
+        .args([
+            "interface",
+            "ipv4",
+            "set",
+            "interface",
+            &if_index.to_string(),
+            "weakhostsend=enabled",
+            "weakhostreceive=enabled",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+/// Purge any lingering /8 static routes that conflict with Multi-WAN socket binding
+pub fn purge_conflicting_kernel_routes() {
+    let mut del_commands = String::from("@echo off\r\n");
+    for octet in 1..=223u8 {
+        if octet == 10 || octet == 127 || octet == 169 || octet == 172 || octet == 192 {
+            continue;
+        }
+        del_commands.push_str(&format!("route DELETE {}.0.0.0 MASK 255.0.0.0 >nul 2>&1\r\n", octet));
+    }
+
+    let temp_dir = std::env::temp_dir();
+    let bat_path = temp_dir.join(format!("netfusion_clean_routes_{}.bat", std::process::id()));
+    if let Ok(_) = std::fs::write(&bat_path, &del_commands) {
+        let _ = Command::new("cmd")
+            .args(["/C", bat_path.to_str().unwrap_or("")])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let _ = std::fs::remove_file(&bat_path);
     }
 }
 

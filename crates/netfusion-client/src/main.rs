@@ -70,8 +70,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // 0. STRICT GUARANTEE: Reset any stale proxy immediately on startup
+    // 0. STRICT GUARANTEE: Reset any stale proxy and conflicting routes immediately on startup
     proxy::disable_windows_proxy();
+    route::purge_conflicting_kernel_routes();
 
     // 1. Single instance mutex to prevent multiple conflicting instances
     use std::os::windows::ffi::OsStrExt;
@@ -243,9 +244,10 @@ async fn run_bonding_engine(
         .parse()
         .map_err(|e| format!("Invalid server endpoint {}: {}", config.server_endpoint, e))?;
 
-    // 2. Setup bypass routes to avoid routing loop if remote server is used
+    // 2. Setup bypass routes and enable Weak Host Model across all physical interfaces
     let mut route_mgr = RouteManager::new();
     for wan in &eligible_wans {
+        route::enable_weak_host_model(wan.if_index);
         if let (Some(gw), Some(_)) = (wan.gateway, wan.ipv4_addr) {
             let _ = route_mgr.add_server_bypass_route(*server_sockaddr.ip(), gw, wan.if_index);
         }
@@ -559,6 +561,7 @@ async fn run_bonding_engine(
                                     pm.capacity_weight = 1.0;
                                     pm.is_alive = true;
                                     sched_mut.add_path(pm);
+                                    route::enable_weak_host_model(wan.if_index);
                                     info!("Dynamically discovered newly connected network: {} ({:?})", wan.network_name, ip);
                                 }
                             }
@@ -701,8 +704,9 @@ async fn run_bonding_engine(
         }
     }
 
-    // Always restore Windows proxy on exit
+    // Always restore Windows proxy and clean routes on exit
     proxy::disable_windows_proxy();
+    route::purge_conflicting_kernel_routes();
 
     Ok(())
 }

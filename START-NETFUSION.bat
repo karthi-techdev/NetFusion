@@ -20,6 +20,17 @@ echo             (1-Click True Packet Multipath Bonding System)
 echo =========================================================================
 echo.
 
+:: Fix any conflicting /8 kernel routes left from earlier routing tests
+echo [*] Purging any conflicting /8 kernel routes...
+for /L %%i in (1,1,223) do (
+    route delete %%i.0.0.0 mask 255.0.0.0 >nul 2>&1
+)
+
+:: Enable Weak Host Model on active interfaces so multiple adapters can send/receive freely
+echo [*] Configuring multi-WAN interfaces for parallel routing...
+netsh interface ipv4 set interface "Ethernet" weakhostsend=enabled weakhostreceive=enabled >nul 2>&1
+netsh interface ipv4 set interface "WiFi" weakhostsend=enabled weakhostreceive=enabled >nul 2>&1
+
 :: Fix any unquoted stray files in Users directory that break MinGW linker
 if exist "%SYSTEMDRIVE%\Users\%USERNAME%" (
     if not exist "%SYSTEMDRIVE%\Users\%USERNAME%\" (
@@ -76,6 +87,10 @@ pause
 
 echo [*] Restoring network settings and stopping NetFusion...
 taskkill /f /im NetFusion.exe >nul 2>&1
+taskkill /f /im NetFusion-Portable.exe >nul 2>&1
+for /L %%i in (1,1,223) do (
+    route delete %%i.0.0.0 mask 255.0.0.0 >nul 2>&1
+)
 powershell -NoProfile -Command "Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -Name ProxyEnable -Value 0" >nul 2>&1
 echo [OK] Stopped cleanly. Internet connection 100%% active.
 echo [OK] NetFusion stopped cleanly. Internet settings restored.

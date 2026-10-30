@@ -109,14 +109,23 @@ async fn handle_client(
         };
 
         if let Some((pid, _name, local_ip, if_index)) = target_wan {
-            let target_addr_opt = tokio::net::lookup_host(format!("{}:{}", target_host, target_port))
-                .await
-                .ok()
-                .and_then(|mut it| it.find(|a| a.is_ipv4()));
+            let target_addr_opt = match tokio::time::timeout(
+                std::time::Duration::from_millis(3000),
+                tokio::net::lookup_host(format!("{}:{}", target_host, target_port)),
+            ).await {
+                Ok(Ok(mut it)) => it.find(|a| a.is_ipv4()),
+                _ => None,
+            };
 
             if let Some(target_sockaddr) = target_addr_opt {
-                // Attempt connection via chosen interface
-                let mut connect_res = bind_and_connect(local_ip, if_index, target_sockaddr).await;
+                // Attempt connection via chosen interface with 2.5s timeout
+                let mut connect_res = match tokio::time::timeout(
+                    std::time::Duration::from_millis(2500),
+                    bind_and_connect(local_ip, if_index, target_sockaddr),
+                ).await {
+                    Ok(res) => res,
+                    Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Interface connect timeout")),
+                };
                 let mut active_pid = pid;
 
                 // Failover: if connection on this path fails, try other available interfaces
@@ -124,7 +133,14 @@ async fn handle_client(
                     let wans = wan_interfaces.read().clone();
                     for (alt_pid, _, alt_ip, alt_idx) in &wans {
                         if *alt_pid != pid {
-                            if let Ok(stream) = bind_and_connect(*alt_ip, *alt_idx, target_sockaddr).await {
+                            let alt_res = match tokio::time::timeout(
+                                std::time::Duration::from_millis(2500),
+                                bind_and_connect(*alt_ip, *alt_idx, target_sockaddr),
+                            ).await {
+                                Ok(res) => res,
+                                Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Interface connect timeout")),
+                            };
+                            if let Ok(stream) = alt_res {
                                 connect_res = Ok(stream);
                                 active_pid = *alt_pid;
                                 break;
@@ -186,7 +202,11 @@ async fn handle_client(
                         let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                     }
                 }
+            } else {
+                let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
             }
+        } else {
+            let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
         }
     } else {
         // Plain HTTP proxying
@@ -224,20 +244,36 @@ async fn handle_client(
             };
 
             if let Some((pid, _name, local_ip, if_index)) = target_wan {
-                let target_addr_opt = tokio::net::lookup_host(format!("{}:{}", target_host, target_port))
-                    .await
-                    .ok()
-                    .and_then(|mut it| it.find(|a| a.is_ipv4()));
+                let target_addr_opt = match tokio::time::timeout(
+                    std::time::Duration::from_millis(3000),
+                    tokio::net::lookup_host(format!("{}:{}", target_host, target_port)),
+                ).await {
+                    Ok(Ok(mut it)) => it.find(|a| a.is_ipv4()),
+                    _ => None,
+                };
 
                 if let Some(target_sockaddr) = target_addr_opt {
-                    let mut connect_res = bind_and_connect(local_ip, if_index, target_sockaddr).await;
+                    let mut connect_res = match tokio::time::timeout(
+                        std::time::Duration::from_millis(2500),
+                        bind_and_connect(local_ip, if_index, target_sockaddr),
+                    ).await {
+                        Ok(res) => res,
+                        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Interface connect timeout")),
+                    };
                     let mut active_pid = pid;
 
                     if connect_res.is_err() {
                         let wans = wan_interfaces.read().clone();
                         for (alt_pid, _, alt_ip, alt_idx) in &wans {
                             if *alt_pid != pid {
-                                if let Ok(stream) = bind_and_connect(*alt_ip, *alt_idx, target_sockaddr).await {
+                                let alt_res = match tokio::time::timeout(
+                                    std::time::Duration::from_millis(2500),
+                                    bind_and_connect(*alt_ip, *alt_idx, target_sockaddr),
+                                ).await {
+                                    Ok(res) => res,
+                                    Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Interface connect timeout")),
+                                };
+                                if let Ok(stream) = alt_res {
                                     connect_res = Ok(stream);
                                     active_pid = *alt_pid;
                                     break;
@@ -297,8 +333,14 @@ async fn handle_client(
                         });
 
                         let _ = tokio::join!(t1, t2);
+                    } else {
+                        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                     }
+                } else {
+                    let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 }
+            } else {
+                let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
             }
         }
     }
@@ -358,11 +400,16 @@ async fn bind_and_connect(
                 unsafe { std::net::TcpStream::from_raw_socket(socket.as_raw_socket() as _) };
             std::mem::forget(socket);
             let stream = TcpStream::from_std(std_stream)?;
-            stream.writable().await?;
-            if let Some(e) = stream.take_error()? {
-                return Err(e);
+            match tokio::time::timeout(std::time::Duration::from_millis(2000), stream.writable()).await {
+                Ok(Ok(())) => {
+                    if let Some(e) = stream.take_error()? {
+                        return Err(e);
+                    }
+                    Ok(stream)
+                }
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "TCP connect timeout")),
             }
-            Ok(stream)
         }
         Err(err) => Err(err),
     }
