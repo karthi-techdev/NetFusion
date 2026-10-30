@@ -16,6 +16,8 @@ pub struct WanInterfaceInfo {
     pub name: String,
     pub ipv4: Option<Ipv4Addr>,
     pub ipv6: Option<Ipv6Addr>,
+    pub gateway: Option<Ipv4Addr>,
+    pub ipv6_gateway: Option<Ipv6Addr>,
     pub if_index: u32,
 }
 
@@ -173,11 +175,33 @@ async fn handle_client(
                 let connect_res = connect_with_failover(&wan, &target_addrs, &wan_interfaces).await;
 
                 if let Ok((mut remote_stream, active_pid)) = connect_res {
-                    remote_stream.write_all(&buf[..n]).await?;
+                    let payload = if first_line.contains(" http://") {
+                        let parts: Vec<&str> = first_line.split_whitespace().collect();
+                        if parts.len() >= 3 {
+                            let method = parts[0];
+                            let uri = parts[1];
+                            let version = parts[2];
+                            if let Some(slash_idx) = uri[7..].find('/') {
+                                let path = &uri[7 + slash_idx..];
+                                let new_first = format!("{} {} {}\r\n", method, path, version);
+                                let rest = &req_str[first_line.len()..];
+                                let rest = rest.strip_prefix("\r\n").or_else(|| rest.strip_prefix("\n")).unwrap_or(rest);
+                                format!("{}{}", new_first, rest).into_bytes()
+                            } else {
+                                buf[..n].to_vec()
+                            }
+                        } else {
+                            buf[..n].to_vec()
+                        }
+                    } else {
+                        buf[..n].to_vec()
+                    };
+
+                    remote_stream.write_all(&payload).await?;
                     {
                         let mut s = scheduler.write();
                         if let Some(p) = s.paths_mut().iter_mut().find(|p| p.path_id == active_pid) {
-                            p.tx_bytes += n as u64;
+                            p.tx_bytes += payload.len() as u64;
                             p.tx_packets += 1;
                         }
                     }
@@ -266,6 +290,21 @@ async fn try_wan_connect(
     }
 
     for remote in candidates {
+        // Pin host route to chosen WAN's gateway so Windows kernel routes the SYN packet
+        // directly out of this physical WAN adapter and never drops across gateways!
+        match remote {
+            SocketAddr::V4(v4) => {
+                if let Some(gw) = wan.gateway {
+                    let _ = crate::route::add_route_entry_v4(*v4.ip(), 32, gw, wan.if_index, 1);
+                }
+            }
+            SocketAddr::V6(v6) => {
+                if let Some(gw6) = wan.ipv6_gateway {
+                    let _ = crate::route::add_route_entry_v6(*v6.ip(), 128, gw6, wan.if_index, 1);
+                }
+            }
+        }
+
         match tokio::time::timeout(
             std::time::Duration::from_millis(2500),
             bind_and_connect(wan.ipv4, wan.ipv6, wan.if_index, remote),
@@ -341,7 +380,29 @@ async fn bind_and_connect(
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_nonblocking(true)?;
 
-    // 1. Force outbound interface selection via IP_UNICAST_IF / IPV6_UNICAST_IF on Windows
+    // 1. Bind to source interface address FIRST
+    match remote_addr {
+        SocketAddr::V4(_) => {
+            let bind_addr = local_ipv4
+                .map(|ip| SocketAddrV4::new(ip, 0))
+                .unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+            if socket.bind(&bind_addr.into()).is_err() {
+                let any = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+                let _ = socket.bind(&any.into());
+            }
+        }
+        SocketAddr::V6(_) => {
+            let bind_addr = local_ipv6
+                .map(|ip| SocketAddrV6::new(ip, 0, 0, 0))
+                .unwrap_or(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
+            if socket.bind(&bind_addr.into()).is_err() {
+                let any = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+                let _ = socket.bind(&any.into());
+            }
+        }
+    }
+
+    // 2. Force outbound interface selection via IP_UNICAST_IF / IPV6_UNICAST_IF on Windows
     if if_index > 0 {
         unsafe {
             match remote_addr {
@@ -367,28 +428,6 @@ async fn bind_and_connect(
                         std::mem::size_of::<u32>() as i32,
                     );
                 }
-            }
-        }
-    }
-
-    // 2. Bind to source interface address
-    match remote_addr {
-        SocketAddr::V4(_) => {
-            let bind_addr = local_ipv4
-                .map(|ip| SocketAddrV4::new(ip, 0))
-                .unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-            if socket.bind(&bind_addr.into()).is_err() {
-                let any = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
-                let _ = socket.bind(&any.into());
-            }
-        }
-        SocketAddr::V6(_) => {
-            let bind_addr = local_ipv6
-                .map(|ip| SocketAddrV6::new(ip, 0, 0, 0))
-                .unwrap_or(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
-            if socket.bind(&bind_addr.into()).is_err() {
-                let any = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-                let _ = socket.bind(&any.into());
             }
         }
     }

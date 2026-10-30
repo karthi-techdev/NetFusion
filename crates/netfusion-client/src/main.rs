@@ -139,6 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         proxy::disable_windows_proxy();
+        route::cleanup_multipath_routing();
         default_panic(info);
     }));
 
@@ -152,6 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 2 /* CTRL_CLOSE_EVENT */ | 5 /* CTRL_LOGOFF_EVENT */ | 6 /* CTRL_SHUTDOWN_EVENT */ => {
                     proxy::disable_windows_proxy();
+                    route::cleanup_multipath_routing();
                     0
                 }
                 _ => 0,
@@ -177,6 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     impl Drop for SafeProxyCleanup {
         fn drop(&mut self) {
             proxy::disable_windows_proxy();
+            route::cleanup_multipath_routing();
         }
     }
     let _proxy_guard = SafeProxyCleanup;
@@ -216,8 +219,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tray_app.run_loop();
 
-    // Clean up proxy on exit
+    // Clean up proxy and kernel routing on exit
     proxy::disable_windows_proxy();
+    route::cleanup_multipath_routing();
 
     Ok(())
 }
@@ -310,6 +314,8 @@ async fn run_bonding_engine(
             let _ = route_mgr.add_server_bypass_route(*server_sockaddr.ip(), gw, wan.if_index);
         }
     }
+    // Install balanced multipath kernel routes across Ethernet and Wi-Fi
+    route::setup_multipath_routing(&eligible_wans);
 
     // 3. Initialize ChaCha20-Poly1305 encryption key
     let mut key_bytes = [0u8; 32];
@@ -346,6 +352,8 @@ async fn run_bonding_engine(
                 name: wan.name.clone(),
                 ipv4: wan.ipv4_addr,
                 ipv6: wan.ipv6_addr,
+                gateway: wan.gateway,
+                ipv6_gateway: wan.ipv6_gateway,
                 if_index: wan.if_index,
             });
             let local_display = wan.ipv4_addr
@@ -372,6 +380,8 @@ async fn run_bonding_engine(
             name: "LoopbackWAN".to_string(),
             ipv4: Some(loopback_ip),
             ipv6: None,
+            gateway: None,
+            ipv6_gateway: None,
             if_index: 1,
         });
         scheduler.add_path(PathMetrics::new(0, "LoopbackWAN".to_string(), "127.0.0.1".to_string()));
@@ -662,6 +672,8 @@ async fn run_bonding_engine(
                                     name: w.name.clone(),
                                     ipv4: w.ipv4_addr,
                                     ipv6: w.ipv6_addr,
+                                    gateway: w.gateway,
+                                    ipv6_gateway: w.ipv6_gateway,
                                     if_index: w.if_index,
                                 });
                             }

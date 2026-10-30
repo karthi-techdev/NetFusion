@@ -402,21 +402,34 @@ fn handle_menu_command(cmd_id: usize) {
                 // Each stream alternates across all active WAN links (Ethernet and WiFi) to saturate both simultaneously.
                 use std::io::{Read, Write};
                 use std::net::TcpStream;
+                let targets = [
+                    ("proof.ovh.net", "/files/10Mb.dat"),
+                    ("speedtest.tele2.net", "/10MB.zip"),
+                    ("proof.ovh.net", "/files/10Mb.dat"),
+                    ("speedtest.tele2.net", "/10MB.zip"),
+                    ("proof.ovh.net", "/files/10Mb.dat"),
+                    ("speedtest.tele2.net", "/10MB.zip"),
+                    ("proof.ovh.net", "/files/10Mb.dat"),
+                    ("speedtest.tele2.net", "/10MB.zip"),
+                ];
                 let mut handles = Vec::new();
-                for _ in 0..8 {
-                    let h = std::thread::spawn(|| {
+                for &(host, path) in &targets {
+                    let h = std::thread::spawn(move || {
                         if let Ok(mut stream) = TcpStream::connect("127.0.0.1:8080") {
                             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
-                            let req = "GET http://speed.cloudflare.com/__down?bytes=25000000 HTTP/1.1\r\nHost: speed.cloudflare.com\r\nConnection: close\r\n\r\n";
+                            let req = format!(
+                                "GET http://{}{} HTTP/1.1\r\nHost: {}\r\nUser-Agent: NetFusion-BondingEngine\r\nConnection: close\r\n\r\n",
+                                host, path, host
+                            );
                             let _ = stream.write_all(req.as_bytes());
-                            let mut buf = [0u8; 32768];
+                            let mut buf = [0u8; 65536];
                             while let Ok(n) = stream.read(&mut buf) {
                                 if n == 0 { break; }
                             }
                         }
                     });
                     handles.push(h);
-                    std::thread::sleep(std::time::Duration::from_millis(15));
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 for h in handles {
                     let _ = h.join();
