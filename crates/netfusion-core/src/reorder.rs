@@ -175,7 +175,7 @@ mod tests {
     fn test_reordering_out_of_order() {
         let mut rb = ReorderBuffer::new(1);
 
-        // Packet 2 arrives first (e.g. Jio path faster for this packet)
+        // Packet 2 arrives first (e.g. secondary WAN path faster for this packet)
         let r2 = rb.push(2, Bytes::from_static(b"packet 2"));
         assert!(r2.is_empty(), "Packet 2 should be buffered waiting for 1");
 

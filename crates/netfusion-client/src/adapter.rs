@@ -193,29 +193,40 @@ pub fn discover_adapters() -> Result<Vec<NetworkInterface>, String> {
             "Direct / Link-Local".to_string()
         };
 
-        // Determine human-friendly network/Wi-Fi name (e.g. "Karthi_5G", "Airtel_mkp0_4325")
-        let network_name = match kind {
-            AdapterKind::WiFi => {
-                if let Some(ref ssid) = wifi_ssid {
-                    ssid.clone()
-                } else if let Some(p) = network_profiles.iter().find(|p| p.to_lowercase().contains("5g") || p.to_lowercase().contains("wifi") || p.to_lowercase().contains("karthi")) {
-                    p.clone()
-                } else if !network_profiles.is_empty() {
-                    network_profiles.first().cloned().unwrap_or_else(|| name.clone())
-                } else {
-                    name.clone()
-                }
+        // Determine human-friendly network/Wi-Fi name dynamically:
+        // Reads DhcpNetworkHint from Windows TCP/IP registry for this specific interface GUID
+        // and cross-references with active NetworkListManager connection profiles.
+        let hint_opt = get_adapter_network_hint(&guid);
+        let network_name = if let Some(ref hint) = hint_opt {
+            if let Some(p) = network_profiles.iter().find(|p| {
+                p.to_lowercase().contains(&hint.to_lowercase()) || hint.to_lowercase().contains(&p.to_lowercase())
+            }) {
+                p.clone()
+            } else {
+                hint.clone()
             }
-            AdapterKind::Ethernet => {
-                if let Some(p) = network_profiles.iter().find(|p| p.to_lowercase().contains("airtel") || p.to_lowercase().contains("ethernet") || p.to_lowercase().contains("lan") || !p.to_lowercase().contains("5g")) {
-                    p.clone()
-                } else if network_profiles.len() > 1 {
-                    network_profiles[1].clone()
-                } else {
-                    name.clone()
+        } else {
+            match kind {
+                AdapterKind::WiFi => {
+                    if let Some(ref ssid) = wifi_ssid {
+                        ssid.clone()
+                    } else if !network_profiles.is_empty() {
+                        network_profiles.first().cloned().unwrap_or_else(|| name.clone())
+                    } else {
+                        name.clone()
+                    }
                 }
+                AdapterKind::Ethernet => {
+                    if network_profiles.len() > 1 {
+                        network_profiles[1].clone()
+                    } else if !network_profiles.is_empty() {
+                        network_profiles.first().cloned().unwrap_or_else(|| name.clone())
+                    } else {
+                        name.clone()
+                    }
+                }
+                _ => name.clone(),
             }
-            _ => name.clone(),
         };
 
         interfaces.push(NetworkInterface {
@@ -235,7 +246,90 @@ pub fn discover_adapters() -> Result<Vec<NetworkInterface>, String> {
         curr_ptr = adapter.Next;
     }
 
+    // Dynamic second pass: ensure each distinct WAN interface receives a unique active network profile
+    let mut assigned_profiles = std::collections::HashSet::new();
+    for iface in &interfaces {
+        if !iface.network_name.is_empty() && iface.network_name != iface.name {
+            assigned_profiles.insert(iface.network_name.clone());
+        }
+    }
+
+    for iface in &mut interfaces {
+        if iface.is_eligible_wan() && (iface.network_name.is_empty() || iface.network_name == iface.name) {
+            if let Some(unassigned) = network_profiles.iter().find(|p| !assigned_profiles.contains(*p)) {
+                iface.network_name = unassigned.clone();
+                assigned_profiles.insert(unassigned.clone());
+            }
+        }
+    }
+
     Ok(interfaces)
+}
+
+/// Query the network hint directly from Windows TCP/IP registry for this specific interface GUID
+pub fn get_adapter_network_hint(guid: &str) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Registry::*;
+
+    let clean_guid = guid.trim_matches(|c| c == '{' || c == '}');
+    let subkey_str = format!(r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{{{}}}", clean_guid);
+    let wide_key: Vec<u16> = std::ffi::OsStr::new(&subkey_str).encode_wide().chain(std::iter::once(0)).collect();
+    let val_name: Vec<u16> = std::ffi::OsStr::new("DhcpNetworkHint").encode_wide().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        let mut hkey: HKEY = 0;
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, wide_key.as_ptr(), 0, KEY_READ, &mut hkey) == 0 {
+            let mut val_type = 0;
+            let mut val_len = 0;
+            if RegQueryValueExW(hkey, val_name.as_ptr(), null_mut(), &mut val_type, null_mut(), &mut val_len) == 0 && val_len > 0 {
+                let mut buf = vec![0u8; val_len as usize];
+                if RegQueryValueExW(hkey, val_name.as_ptr(), null_mut(), &mut val_type, buf.as_mut_ptr(), &mut val_len) == 0 {
+                    RegCloseKey(hkey);
+                    let raw_str = if val_type == REG_SZ || val_type == REG_EXPAND_SZ {
+                        let u16_slice = std::slice::from_raw_parts(buf.as_ptr() as *const u16, (val_len as usize) / 2);
+                        String::from_utf16_lossy(u16_slice).trim_matches('\0').to_string()
+                    } else {
+                        String::from_utf8_lossy(&buf).trim_matches('\0').to_string()
+                    };
+                    return decode_swapped_hex_hint(&raw_str);
+                }
+            }
+            RegCloseKey(hkey);
+        }
+    }
+    None
+}
+
+fn decode_swapped_hex_hint(hex_str: &str) -> Option<String> {
+    let clean = hex_str.trim();
+    if clean.len() < 2 || clean.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = clean.as_bytes();
+    let mut decoded = Vec::new();
+    for chunk in bytes.chunks_exact(2) {
+        let low_nibble = hex_char_to_u8(chunk[0])?;
+        let high_nibble = hex_char_to_u8(chunk[1])?;
+        let byte_val = (high_nibble << 4) | low_nibble;
+        if byte_val >= 32 && byte_val <= 126 {
+            decoded.push(byte_val as char);
+        }
+    }
+    let result: String = decoded.into_iter().collect();
+    if !result.is_empty() {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+fn hex_char_to_u8(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Query the current connected Wi-Fi SSID using native Windows WLAN API (wlanapi.dll)
@@ -295,7 +389,7 @@ pub fn get_connected_wifi_ssid() -> Option<String> {
 
 static PROFILE_CACHE: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
 
-/// Query connected Windows NetworkListManager profiles (e.g. "Airtel_mkp0_4325", "Karthi_5G")
+/// Query connected Windows NetworkListManager profiles (e.g. "Home_WiFi", "Office_LAN")
 pub fn get_connected_network_profiles() -> Vec<String> {
     if let Ok(mut cache) = PROFILE_CACHE.lock() {
         if let Some((time, ref profiles)) = *cache {

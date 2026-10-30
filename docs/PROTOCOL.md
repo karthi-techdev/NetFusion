@@ -51,7 +51,7 @@ All NetFusion datagrams begin with a fixed **48-byte header**, followed by the p
 | `Version` | 1 byte | Protocol version: `0x01` |
 | `Msg Type` | 1 byte | Message type identifier (see table below) |
 | `Session ID` | 4 bytes | Unique 32-bit client tunnel session handle |
-| `Path ID` | 1 byte | Physical WAN identifier (`0x00` = Airtel, `0x01` = Jio, etc.) |
+| `Path ID` | 1 byte | Physical WAN identifier (`0x00` = Path 0, `0x01` = Path 1, etc.) |
 | `Flags` | 1 byte | Bitmask: Bit 0 = Retransmit, Bit 1 = Probe, Bit 2 = Urgent, Bit 3 = Encrypted |
 | `Sequence Number`| 8 bytes | Monotonically increasing 64-bit global sequence number |
 | `Path Seq Num` | 4 bytes | Per-path sequence counter used for path loss measurement |

@@ -4,9 +4,9 @@
 
 **NetFusion** is a lightweight, high-performance Windows internet bonding engine and Linux tunnel gateway designed for true **packet-level multipath bandwidth aggregation**.
 
-Traditional multi-WAN solutions (such as dual-WAN routers or Windows connection-metric switching) only perform **session-based load balancing**: each individual TCP session or HTTP download is assigned to only one WAN interface. As a result, a single large download can never exceed the speed of the fastest single connection (e.g., capped at 40 Mbps on an Airtel 40 Mbps + Jio 10 Mbps dual-connection setup).
+Traditional multi-WAN solutions (such as dual-WAN routers or Windows connection-metric switching) only perform **session-based load balancing**: each individual TCP session or HTTP download is assigned to only one WAN interface. As a result, a single large download can never exceed the speed of the fastest single connection (e.g., capped at 40 Mbps on a 40 Mbps Fiber + 10 Mbps Mobile dual-connection setup).
 
-NetFusion operates at **Layer 3 (IP Packet Level)**. Raw IP packets from any application (single TCP streams, UDP streams, torrents, browsers) are captured via a high-performance **Wintun** virtual network adapter, sequenced with 64-bit monotonic sequence numbers, encrypted with ChaCha20-Poly1305, and intelligently scheduled across all active physical internet adapters (Airtel Broadband, Jio Fiber, 5G USB tethering).
+NetFusion operates at **Layer 3 (IP Packet Level)**. Raw IP packets from any application (single TCP streams, UDP streams, torrents, browsers) are captured via a high-performance **Wintun** virtual network adapter, sequenced with 64-bit monotonic sequence numbers, encrypted with ChaCha20-Poly1305, and intelligently scheduled across all active physical internet adapters (Fiber Broadband, 5G Cellular Tethering, Wi-Fi, Ethernet).
 
 On the remote Linux bonding server, packets arriving across different WAN paths are reordered in an adaptive jitter buffer, injected into a Linux TUN interface (`nf-tun0`), and masqueraded (NAT) to the public internet. Return packets from the internet are similarly scheduled across the client's WAN paths in proportion to real-time capacity and delay, recombined in the Windows client reorder buffer, and delivered into Wintun.
 
@@ -44,14 +44,14 @@ On the remote Linux bonding server, packets arriving across different WAN paths 
 |                           v                               v                          |
 |  +---------------------------------+             +---------------------------------+ |
 |  |  Physical Adapter: WiFi         |             |  Physical Adapter: Ethernet     | |
-|  |  Local IP: 192.168.1.12         |             |  Local IP: 192.168.29.7         | |
-|  |  Airtel Fiber (40 Mbps capacity)|             |  Jio Fiber (10 Mbps capacity)   | |
+|  |  Local IP: 192.0.2.10           |             |  Local IP: 198.51.100.10        | |
+|  |  WAN 1 (Fiber 40 Mbps capacity) |             |  WAN 2 (5G 10 Mbps capacity)    | |
 |  +----------------+----------------+             +----------------+----------------+ |
 +-------------------|-----------------------------------------------|-------------------+
                     |                                               |
                     | (Encrypted UDP Tunnel Datagrams)              | (Encrypted UDP Tunnel Datagrams)
                     v                                               v
-        [ Airtel ISP Infrastructure ]                   [ Jio ISP Infrastructure ]
+        [ ISP 1 Infrastructure ]                        [ ISP 2 Infrastructure ]
                     \                                               /
                      \                                             /
                       v                                           v
@@ -90,7 +90,7 @@ On the remote Linux bonding server, packets arriving across different WAN paths 
 ## 2. Overcoming Fundamental Challenges in Packet-Level Multipath
 
 ### A. Head-of-Line (HoL) Blocking and Latency Disparities
-When combining connections with differing latencies (e.g. Airtel with 15ms latency and Jio with 30ms latency), naive round-robin scheduling causes packets to arrive out of order at the destination.
+When combining connections with differing latencies (e.g. Fiber with 15ms latency and 5G with 35ms latency), naive round-robin scheduling causes packets to arrive out of order at the destination.
 - Standard TCP interprets out-of-order packets as network packet loss.
 - Three duplicate ACKs (DupAcks) trigger **Fast Retransmit** and cut the TCP congestion window (`cwnd`) by 50%, resulting in degraded performance rather than aggregate speed.
 

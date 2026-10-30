@@ -134,8 +134,8 @@ NetFusion is designed to be unobtrusive and lightweight. When you click the Syst
   ⚡ NetFusion Engine: ACTIVE (Merging 2 Connections)
   📶 Combined Speed: 98.40 Mbps  (TX: 1.20 Mbps)
   --------------------------------------------------
-  🟢 [Ethernet] Airtel_Fiber: 49.20 Mbps  (TX: 0.60 Mbps)
-  🟢 [WiFi] Karthi_5G: 49.20 Mbps  (TX: 0.60 Mbps)
+  🟢 [Ethernet] Fiber_Broadband: 49.20 Mbps  (TX: 0.60 Mbps)
+  🟢 [WiFi] 5G_Mobile_Hotspot: 49.20 Mbps  (TX: 0.60 Mbps)
   --------------------------------------------------
   ⏸ Pause Merging
   🚀 Test Combined Speed Now (5s)

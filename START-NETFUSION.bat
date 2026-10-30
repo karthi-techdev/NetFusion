@@ -20,9 +20,11 @@ echo             (1-Click True Packet Multipath Bonding System)
 echo =========================================================================
 echo.
 
-:: Fix any unquoted stray log files in C:\Users that break MinGW linker
-if exist "C:\Users\KARTHI" (
-    ren "C:\Users\KARTHI" KARTHI_install_log.bak >nul 2>&1
+:: Fix any unquoted stray files in Users directory that break MinGW linker
+if exist "%SYSTEMDRIVE%\Users\%USERNAME%" (
+    if not exist "%SYSTEMDRIVE%\Users\%USERNAME%\" (
+        ren "%SYSTEMDRIVE%\Users\%USERNAME%" "%USERNAME%_bak" >nul 2>&1
+    )
 )
 
 set "PATH=%USERPROFILE%\.cargo\bin;%LOCALAPPDATA%\Microsoft\WinGet\Links;%PATH%"
@@ -54,7 +56,7 @@ if not exist "configs\client.json" (
 :: ============================================================================
 :: 3. LAUNCH BONDING ENGINE & DASHBOARD TOGETHER
 :: ============================================================================
-echo [*] Detecting network interfaces (Airtel / Jio / Ethernet / WiFi)...
+echo [*] Detecting network interfaces (Ethernet / WiFi / Mobile Hotspot)...
 echo [*] Launching NetFusion Bonding Engine and Live Dashboard...
 echo.
 

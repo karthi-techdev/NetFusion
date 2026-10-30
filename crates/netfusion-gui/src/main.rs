@@ -91,7 +91,7 @@ impl NetFusionApp {
 
         std::thread::spawn(move || {
             // Send requests through the local bonding dispatcher on 127.0.0.1:8080
-            // which splits traffic across both Airtel and Jio interfaces
+            // which splits traffic across multiple WAN interfaces
             use std::io::{Read, Write};
             let mut handles = Vec::new();
             for _ in 0..6 {

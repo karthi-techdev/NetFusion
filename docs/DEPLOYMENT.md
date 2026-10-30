@@ -36,7 +36,7 @@ ip addr show nf-tun0
 ### Requirements
 - Windows 10 / Windows 11 (64-bit)
 - Two or more active internet connections:
-  - e.g. Wi-Fi (Airtel Broadband) + Ethernet (Jio Fiber) or USB 5G Tethering.
+  - e.g. Wi-Fi (Fiber Broadband) + Ethernet (5G Tethering) or USB Mobile Tethering.
 - Administrator privileges (for virtual network adapter creation and routing setup).
 
 ### Configuration (`configs/client.json`)
@@ -73,7 +73,7 @@ cargo run --release -p netfusion-client -- --config configs/client.json
 cargo run --release -p netfusion-gui
 ```
 The native dashboard displays:
-- Real-time combined and per-ISP throughput gauges (Airtel, Jio).
+- Real-time combined and per-link throughput gauges.
 - CPU utilization & RAM consumption (confirming <1% CPU and 20–50 MB RAM).
 - Latency (RTT) and packet loss per path.
 - Start / Stop bonding controls and mode switcher.

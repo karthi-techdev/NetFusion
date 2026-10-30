@@ -5,7 +5,7 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 
-/// Represents an individual bonded WAN uplink (e.g. Airtel, Jio) bound strictly
+/// Represents an individual bonded WAN uplink bound strictly
 /// to its respective local IP interface address.
 #[allow(dead_code)]
 pub struct WanPathSocket {

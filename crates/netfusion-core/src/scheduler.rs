@@ -209,14 +209,14 @@ mod tests {
     fn test_scheduler_weighted_distribution() {
         let mut sched = AdaptiveScheduler::new(1500.0);
 
-        // Path 0: Airtel (40 Mbps, weight 4.0, RTT 15ms)
-        let mut p0 = PathMetrics::new(0, "Airtel".to_string(), "192.168.1.100".to_string());
+        // Path 0: WAN Primary (40 Mbps, weight 4.0, RTT 15ms)
+        let mut p0 = PathMetrics::new(0, "WAN_Primary".to_string(), "192.0.2.1".to_string());
         p0.capacity_weight = 4.0;
         p0.smoothed_rtt = Duration::from_millis(15);
         sched.add_path(p0);
 
-        // Path 1: Jio (10 Mbps, weight 1.0, RTT 25ms)
-        let mut p1 = PathMetrics::new(1, "Jio".to_string(), "192.168.2.100".to_string());
+        // Path 1: WAN Secondary (10 Mbps, weight 1.0, RTT 25ms)
+        let mut p1 = PathMetrics::new(1, "WAN_Secondary".to_string(), "198.51.100.1".to_string());
         p1.capacity_weight = 1.0;
         p1.smoothed_rtt = Duration::from_millis(25);
         sched.add_path(p1);
@@ -230,10 +230,10 @@ mod tests {
             }
         }
 
-        // Airtel should receive significantly more packets than Jio (expected ~4:1 ratio)
+        // WAN Primary should receive significantly more packets than WAN Secondary (expected ~4:1 ratio)
         assert!(
             counts[0] > counts[1] * 2,
-            "Airtel ({}) should receive at least 2x more than Jio ({})",
+            "WAN Primary ({}) should receive at least 2x more than Secondary ({})",
             counts[0],
             counts[1]
         );
