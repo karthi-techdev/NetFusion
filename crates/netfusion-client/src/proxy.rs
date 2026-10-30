@@ -2,12 +2,83 @@ use log::{info, warn};
 use netfusion_core::scheduler::AdaptiveScheduler;
 use parking_lot::RwLock;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::windows::io::{AsRawSocket, FromRawSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+// High-speed lock-free atomic bandwidth accounting for proxy paths
+pub static PROXY_PATH_RX_BYTES: [AtomicU64; 16] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+pub static PROXY_PATH_TX_BYTES: [AtomicU64; 16] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+pub static PROXY_PATH_RX_PACKETS: [AtomicU64; 16] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+pub static PROXY_PATH_TX_PACKETS: [AtomicU64; 16] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+
+// In-memory DNS cache to eliminate duplicate DNS queries across parallel streams
+struct DnsEntry {
+    addrs: Vec<SocketAddr>,
+    expires_at: Instant,
+}
+static DNS_CACHE: RwLock<Option<HashMap<String, DnsEntry>>> = RwLock::new(None);
+
+async fn cached_resolve(host: &str, port: u16) -> Vec<SocketAddr> {
+    let key = format!("{}:{}", host, port);
+    {
+        let cache_lock = DNS_CACHE.read();
+        if let Some(ref cache) = *cache_lock {
+            if let Some(entry) = cache.get(&key) {
+                if Instant::now() < entry.expires_at {
+                    return entry.addrs.clone();
+                }
+            }
+        }
+    }
+
+    let addrs: Vec<SocketAddr> = match tokio::time::timeout(
+        std::time::Duration::from_millis(2000),
+        tokio::net::lookup_host(&key),
+    ).await {
+        Ok(Ok(iter)) => iter.collect(),
+        _ => Vec::new(),
+    };
+
+    if !addrs.is_empty() {
+        let mut cache_lock = DNS_CACHE.write();
+        let map = cache_lock.get_or_insert_with(HashMap::new);
+        map.insert(
+            key,
+            DnsEntry {
+                addrs: addrs.clone(),
+                expires_at: Instant::now() + std::time::Duration::from_secs(120),
+            },
+        );
+    }
+
+    addrs
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -54,6 +125,7 @@ impl LocalDispatcher {
         loop {
             match listener.accept().await {
                 Ok((client_stream, _client_addr)) => {
+                    let _ = client_stream.set_nodelay(true);
                     let scheduler = self.scheduler.clone();
                     let wan_interfaces = self.wan_interfaces.clone();
                     let is_active = self.bonding_active.load(Ordering::Relaxed);
@@ -67,7 +139,7 @@ impl LocalDispatcher {
                 }
                 Err(e) => {
                     warn!("Local dispatcher accept error: {}", e);
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
             }
         }
@@ -112,14 +184,7 @@ async fn handle_client(
         };
 
         if let Some(wan) = target_wan {
-            let target_addrs: Vec<SocketAddr> = match tokio::time::timeout(
-                std::time::Duration::from_millis(3000),
-                tokio::net::lookup_host(format!("{}:{}", target_host, target_port)),
-            ).await {
-                Ok(Ok(iter)) => iter.collect(),
-                _ => Vec::new(),
-            };
-
+            let target_addrs = cached_resolve(&target_host, target_port).await;
             let connect_res = connect_with_failover(&wan, &target_addrs, &wan_interfaces).await;
 
             match connect_res {
@@ -128,7 +193,7 @@ async fn handle_client(
                         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                         .await?;
 
-                    splice_bidirectional(client, remote_stream, scheduler, active_pid).await;
+                    splice_bidirectional(client, remote_stream, active_pid).await;
                 }
                 Err(_) => {
                     let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
@@ -164,14 +229,7 @@ async fn handle_client(
             };
 
             if let Some(wan) = target_wan {
-                let target_addrs: Vec<SocketAddr> = match tokio::time::timeout(
-                    std::time::Duration::from_millis(3000),
-                    tokio::net::lookup_host(format!("{}:{}", target_host, target_port)),
-                ).await {
-                    Ok(Ok(iter)) => iter.collect(),
-                    _ => Vec::new(),
-                };
-
+                let target_addrs = cached_resolve(&target_host, target_port).await;
                 let connect_res = connect_with_failover(&wan, &target_addrs, &wan_interfaces).await;
 
                 if let Ok((mut remote_stream, active_pid)) = connect_res {
@@ -198,15 +256,11 @@ async fn handle_client(
                     };
 
                     remote_stream.write_all(&payload).await?;
-                    {
-                        let mut s = scheduler.write();
-                        if let Some(p) = s.paths_mut().iter_mut().find(|p| p.path_id == active_pid) {
-                            p.tx_bytes += payload.len() as u64;
-                            p.tx_packets += 1;
-                        }
-                    }
+                    let pid = (active_pid as usize).min(15);
+                    PROXY_PATH_TX_BYTES[pid].fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    PROXY_PATH_TX_PACKETS[pid].fetch_add(1, Ordering::Relaxed);
 
-                    splice_bidirectional(client, remote_stream, scheduler, active_pid).await;
+                    splice_bidirectional(client, remote_stream, active_pid).await;
                 } else {
                     let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 }
@@ -290,23 +344,8 @@ async fn try_wan_connect(
     }
 
     for remote in candidates {
-        // Pin host route to chosen WAN's gateway so Windows kernel routes the SYN packet
-        // directly out of this physical WAN adapter and never drops across gateways!
-        match remote {
-            SocketAddr::V4(v4) => {
-                if let Some(gw) = wan.gateway {
-                    let _ = crate::route::add_route_entry_v4(*v4.ip(), 32, gw, wan.if_index, 1);
-                }
-            }
-            SocketAddr::V6(v6) => {
-                if let Some(gw6) = wan.ipv6_gateway {
-                    let _ = crate::route::add_route_entry_v6(*v6.ip(), 128, gw6, wan.if_index, 1);
-                }
-            }
-        }
-
         match tokio::time::timeout(
-            std::time::Duration::from_millis(2500),
+            std::time::Duration::from_millis(1500),
             bind_and_connect(wan.ipv4, wan.ipv6, wan.if_index, remote),
         ).await {
             Ok(Ok(stream)) => return Ok(stream),
@@ -317,18 +356,23 @@ async fn try_wan_connect(
     Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Interface connect failed"))
 }
 
+/// Ultra-high performance lock-free zero-contention bidirectional stream splicer.
+/// Uses 64KB stack buffers, TCP_NODELAY, and atomic bandwidth counters with ZERO mutex waits.
 async fn splice_bidirectional(
     client: TcpStream,
     remote: TcpStream,
-    scheduler: Arc<RwLock<AdaptiveScheduler>>,
     active_pid: u8,
 ) {
+    let _ = client.set_nodelay(true);
+    let _ = remote.set_nodelay(true);
+
     let (mut cr, mut cw) = client.into_split();
     let (mut rr, mut rw) = remote.into_split();
 
-    let sched1 = scheduler.clone();
+    let pid = (active_pid as usize).min(15);
+
     let t1 = tokio::spawn(async move {
-        let mut temp_buf = vec![0u8; 32768];
+        let mut temp_buf = [0u8; 65536];
         while let Ok(read_bytes) = cr.read(&mut temp_buf).await {
             if read_bytes == 0 {
                 break;
@@ -336,17 +380,13 @@ async fn splice_bidirectional(
             if rw.write_all(&temp_buf[..read_bytes]).await.is_err() {
                 break;
             }
-            let mut s = sched1.write();
-            if let Some(p) = s.paths_mut().iter_mut().find(|p| p.path_id == active_pid) {
-                p.tx_bytes += read_bytes as u64;
-                p.tx_packets += 1;
-            }
+            PROXY_PATH_TX_BYTES[pid].fetch_add(read_bytes as u64, Ordering::Relaxed);
+            PROXY_PATH_TX_PACKETS[pid].fetch_add(1, Ordering::Relaxed);
         }
     });
 
-    let sched2 = scheduler.clone();
     let t2 = tokio::spawn(async move {
-        let mut temp_buf = vec![0u8; 32768];
+        let mut temp_buf = [0u8; 65536];
         while let Ok(read_bytes) = rr.read(&mut temp_buf).await {
             if read_bytes == 0 {
                 break;
@@ -354,11 +394,8 @@ async fn splice_bidirectional(
             if cw.write_all(&temp_buf[..read_bytes]).await.is_err() {
                 break;
             }
-            let mut s = sched2.write();
-            if let Some(p) = s.paths_mut().iter_mut().find(|p| p.path_id == active_pid) {
-                p.rx_bytes += read_bytes as u64;
-                p.rx_packets += 1;
-            }
+            PROXY_PATH_RX_BYTES[pid].fetch_add(read_bytes as u64, Ordering::Relaxed);
+            PROXY_PATH_RX_PACKETS[pid].fetch_add(1, Ordering::Relaxed);
         }
     });
 
@@ -366,7 +403,7 @@ async fn splice_bidirectional(
 }
 
 /// Asynchronously bind a TCP socket strictly to a physical network adapter's local IP and interface index
-/// using Winsock IP_UNICAST_IF / IPV6_UNICAST_IF to guarantee traffic routes directly through the chosen physical adapter.
+/// using Winsock IP_UNICAST_IF / IPV6_UNICAST_IF with TCP_NODELAY and 2MB window scaling.
 async fn bind_and_connect(
     local_ipv4: Option<Ipv4Addr>,
     local_ipv6: Option<Ipv6Addr>,
@@ -380,7 +417,43 @@ async fn bind_and_connect(
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_nonblocking(true)?;
 
-    // 1. Bind to source interface address FIRST
+    // 1. Critical for low latency: Disable Nagle's algorithm (TCP_NODELAY)
+    let _ = socket.set_nodelay(true);
+
+    // 2. High throughput window scaling (2MB buffer)
+    let _ = socket.set_recv_buffer_size(2 * 1024 * 1024);
+    let _ = socket.set_send_buffer_size(2 * 1024 * 1024);
+
+    // 3. Force outbound interface selection via IP_UNICAST_IF / IPV6_UNICAST_IF on Windows
+    // MUST BE CALLED BEFORE BIND SO WINSOCK ALIGNS ROUTING AND EPHEMERAL PORT SELECTION!
+    if if_index > 0 {
+        unsafe {
+            match remote_addr {
+                SocketAddr::V4(_) => {
+                    let net_if_index = if_index.to_be();
+                    windows_sys::Win32::Networking::WinSock::setsockopt(
+                        socket.as_raw_socket() as _,
+                        0,  // IPPROTO_IP
+                        31, // IP_UNICAST_IF
+                        &net_if_index as *const _ as *const u8,
+                        std::mem::size_of::<u32>() as i32,
+                    );
+                }
+                SocketAddr::V6(_) => {
+                    let host_if_index = if_index;
+                    windows_sys::Win32::Networking::WinSock::setsockopt(
+                        socket.as_raw_socket() as _,
+                        41, // IPPROTO_IPV6
+                        31, // IPV6_UNICAST_IF
+                        &host_if_index as *const _ as *const u8,
+                        std::mem::size_of::<u32>() as i32,
+                    );
+                }
+            }
+        }
+    }
+
+    // 4. Bind to source interface address
     match remote_addr {
         SocketAddr::V4(_) => {
             let bind_addr = local_ipv4
@@ -402,42 +475,14 @@ async fn bind_and_connect(
         }
     }
 
-    // 2. Force outbound interface selection via IP_UNICAST_IF / IPV6_UNICAST_IF on Windows
-    if if_index > 0 {
-        unsafe {
-            match remote_addr {
-                SocketAddr::V4(_) => {
-                    // On Windows, IP_UNICAST_IF requires if_index in network byte order (big-endian).
-                    let net_if_index = if_index.to_be();
-                    windows_sys::Win32::Networking::WinSock::setsockopt(
-                        socket.as_raw_socket() as _,
-                        0,  // IPPROTO_IP
-                        31, // IP_UNICAST_IF
-                        &net_if_index as *const _ as *const u8,
-                        std::mem::size_of::<u32>() as i32,
-                    );
-                }
-                SocketAddr::V6(_) => {
-                    // On Windows, IPV6_UNICAST_IF requires if_index in host byte order.
-                    let host_if_index = if_index;
-                    windows_sys::Win32::Networking::WinSock::setsockopt(
-                        socket.as_raw_socket() as _,
-                        41, // IPPROTO_IPV6
-                        31, // IPV6_UNICAST_IF
-                        &host_if_index as *const _ as *const u8,
-                        std::mem::size_of::<u32>() as i32,
-                    );
-                }
-            }
-        }
-    }
-
     match socket.connect(&remote_addr.into()) {
         Ok(()) => {
             let std_stream: std::net::TcpStream =
                 unsafe { std::net::TcpStream::from_raw_socket(socket.as_raw_socket() as _) };
             std::mem::forget(socket);
-            TcpStream::from_std(std_stream)
+            let s = TcpStream::from_std(std_stream)?;
+            let _ = s.set_nodelay(true);
+            Ok(s)
         }
         Err(err)
             if err.raw_os_error() == Some(10035) // WSAEWOULDBLOCK
@@ -447,7 +492,8 @@ async fn bind_and_connect(
                 unsafe { std::net::TcpStream::from_raw_socket(socket.as_raw_socket() as _) };
             std::mem::forget(socket);
             let stream = TcpStream::from_std(std_stream)?;
-            match tokio::time::timeout(std::time::Duration::from_millis(2500), stream.writable()).await {
+            let _ = stream.set_nodelay(true);
+            match tokio::time::timeout(std::time::Duration::from_millis(1500), stream.writable()).await {
                 Ok(Ok(())) => {
                     if let Some(e) = stream.take_error()? {
                         return Err(e);

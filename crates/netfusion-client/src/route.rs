@@ -104,24 +104,13 @@ pub fn add_route_entry_v4(
         if res == 0 || res == 5010 || res == 183 {
             Ok(())
         } else {
-            // Netsh fallback for resilient execution
-            let _ = Command::new("netsh")
-                .args([
-                    "interface", "ipv4", "add", "route",
-                    &format!("{}/{}", dest_ip, prefix_len),
-                    &if_index.to_string(),
-                    &gateway.to_string(),
-                    &format!("metric={}", metric),
-                    "store=active",
-                ])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output();
-            Ok(())
+            Err(res)
         }
     }
 }
 
 /// Add an IPv6 route entry via Windows IP Helper API
+#[allow(dead_code)]
 pub fn add_route_entry_v6(
     dest_ip: Ipv6Addr,
     prefix_len: u8,
@@ -148,18 +137,7 @@ pub fn add_route_entry_v6(
         if res == 0 || res == 5010 || res == 183 {
             Ok(())
         } else {
-            let _ = Command::new("netsh")
-                .args([
-                    "interface", "ipv6", "add", "route",
-                    &format!("{}/{}", dest_ip, prefix_len),
-                    &if_index.to_string(),
-                    &gateway.to_string(),
-                    &format!("metric={}", metric),
-                    "store=active",
-                ])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output();
-            Ok(())
+            Err(res)
         }
     }
 }
@@ -194,6 +172,7 @@ pub fn delete_route_entry_v4(dest_ip: Ipv4Addr, prefix_len: u8, if_index: u32) -
 }
 
 /// Delete an IPv6 route entry
+#[allow(dead_code)]
 pub fn delete_route_entry_v6(dest_ip: Ipv6Addr, prefix_len: u8, if_index: u32) -> Result<(), u32> {
     unsafe {
         let mut row: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
@@ -223,8 +202,8 @@ pub fn delete_route_entry_v6(dest_ip: Ipv6Addr, prefix_len: u8, if_index: u32) -
 }
 
 /// Setup global balanced multipath routing across physical interfaces.
-/// Guarantees that both Ethernet and Wi-Fi have active kernel routes for outbound traffic
-/// so that sockets can communicate concurrently at combined speed.
+/// Guarantees that both Ethernet and Wi-Fi have equal metric default routes and weak host model active
+/// so that sockets bound via IP_UNICAST_IF / IPV6_UNICAST_IF route directly through each physical adapter concurrently.
 pub fn setup_multipath_routing(wans: &[crate::adapter::NetworkInterface]) {
     purge_conflicting_kernel_routes();
 
@@ -234,13 +213,14 @@ pub fn setup_multipath_routing(wans: &[crate::adapter::NetworkInterface]) {
     }
 
     let mut configured_indices = Vec::new();
+    let eligible_indices: std::collections::HashSet<u32> = eligible.iter().map(|w| w.if_index).collect();
 
     // 1. Enable Weak Host Model & equalize interface metrics on all WAN adapters
     for wan in &eligible {
         configured_indices.push(wan.if_index);
         enable_weak_host_model(wan.if_index);
 
-        // Equalize interface metrics so Windows doesn't completely disable secondary interface
+        // Equalize interface metrics so Windows treats both links with equal priority
         let _ = Command::new("netsh")
             .args(["interface", "ipv4", "set", "interface", &wan.if_index.to_string(), "metric=15"])
             .creation_flags(CREATE_NO_WINDOW)
@@ -251,33 +231,41 @@ pub fn setup_multipath_routing(wans: &[crate::adapter::NetworkInterface]) {
             .output();
     }
 
-    // 2. If 2 or more physical interfaces exist, install balanced half-space internet routes
-    if eligible.len() >= 2 {
-        let wan0 = &eligible[0];
-        let wan1 = &eligible[1];
+    // 2. Equalize default route metrics on both IPv4 and IPv6 to 15
+    unsafe {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            FreeMibTable, GetIpForwardTable2, SetIpForwardEntry2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+        };
+        use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
-        // IPv4: 0.0.0.0/1 via WAN0 gateway, 128.0.0.0/1 via WAN1 gateway
-        if let Some(gw0) = wan0.gateway {
-            let dest0 = Ipv4Addr::new(0, 0, 0, 0);
-            let _ = add_route_entry_v4(dest0, 1, gw0, wan0.if_index, 10);
-            info!("Multipath IPv4: 0.0.0.0/1 routed via {} on {} (if: {})", gw0, wan0.name, wan0.if_index);
-        }
-        if let Some(gw1) = wan1.gateway {
-            let dest1 = Ipv4Addr::new(128, 0, 0, 0);
-            let _ = add_route_entry_v4(dest1, 1, gw1, wan1.if_index, 10);
-            info!("Multipath IPv4: 128.0.0.0/1 routed via {} on {} (if: {})", gw1, wan1.name, wan1.if_index);
+        // IPv4 Default Routes
+        let mut table_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+        if GetIpForwardTable2(AF_INET, &mut table_ptr) == 0 && !table_ptr.is_null() {
+            let num_entries = (*table_ptr).NumEntries as usize;
+            let rows_slice = std::slice::from_raw_parts((*table_ptr).Table.as_ptr(), num_entries);
+            for row in rows_slice {
+                if row.DestinationPrefix.PrefixLength == 0 && eligible_indices.contains(&row.InterfaceIndex) {
+                    let mut updated: MIB_IPFORWARD_ROW2 = *row;
+                    updated.Metric = 15;
+                    let _ = SetIpForwardEntry2(&updated);
+                }
+            }
+            FreeMibTable(table_ptr as *const _);
         }
 
-        // IPv6: 2000::/4 via WAN0 IPv6 gateway, 3000::/4 via WAN1 IPv6 gateway
-        if let Some(gw0_v6) = wan0.ipv6_gateway {
-            let dest0_v6: Ipv6Addr = "2000::".parse().unwrap();
-            let _ = add_route_entry_v6(dest0_v6, 4, gw0_v6, wan0.if_index, 10);
-            info!("Multipath IPv6: 2000::/4 routed via {} on {} (if: {})", gw0_v6, wan0.name, wan0.if_index);
-        }
-        if let Some(gw1_v6) = wan1.ipv6_gateway {
-            let dest1_v6: Ipv6Addr = "3000::".parse().unwrap();
-            let _ = add_route_entry_v6(dest1_v6, 4, gw1_v6, wan1.if_index, 10);
-            info!("Multipath IPv6: 3000::/4 routed via {} on {} (if: {})", gw1_v6, wan1.name, wan1.if_index);
+        // IPv6 Default Routes
+        let mut table_v6_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+        if GetIpForwardTable2(AF_INET6, &mut table_v6_ptr) == 0 && !table_v6_ptr.is_null() {
+            let num_entries = (*table_v6_ptr).NumEntries as usize;
+            let rows_slice = std::slice::from_raw_parts((*table_v6_ptr).Table.as_ptr(), num_entries);
+            for row in rows_slice {
+                if row.DestinationPrefix.PrefixLength == 0 && eligible_indices.contains(&row.InterfaceIndex) {
+                    let mut updated: MIB_IPFORWARD_ROW2 = *row;
+                    updated.Metric = 15;
+                    let _ = SetIpForwardEntry2(&updated);
+                }
+            }
+            FreeMibTable(table_v6_ptr as *const _);
         }
     }
 
@@ -295,22 +283,11 @@ pub fn cleanup_multipath_routing() {
 
     info!("Restoring standard Windows kernel routing table...");
 
-    // Remove balanced half-space IPv4 routes
-    let dest0 = Ipv4Addr::new(0, 0, 0, 0);
-    let dest1 = Ipv4Addr::new(128, 0, 0, 0);
-    let dest0_v6: Ipv6Addr = "2000::".parse().unwrap();
-    let dest1_v6: Ipv6Addr = "3000::".parse().unwrap();
-
     let indices = {
         CONFIGURED_IF_INDICES.lock().map(|l| l.clone()).unwrap_or_default()
     };
 
     for idx in indices {
-        let _ = delete_route_entry_v4(dest0, 1, idx);
-        let _ = delete_route_entry_v4(dest1, 1, idx);
-        let _ = delete_route_entry_v6(dest0_v6, 4, idx);
-        let _ = delete_route_entry_v6(dest1_v6, 4, idx);
-
         // Restore interface metrics to automatic
         let _ = Command::new("netsh")
             .args(["interface", "ipv4", "set", "interface", &idx.to_string(), "metric=automatic"])
@@ -355,49 +332,71 @@ pub fn enable_weak_host_model(if_index: u32) {
         .output();
 }
 
-/// Purge any lingering /8 static routes that conflict with Multi-WAN socket binding
+/// Purge any lingering /8, /1, /4, /32, or /128 static routes that conflict with Multi-WAN socket binding
 pub fn purge_conflicting_kernel_routes() {
     unsafe {
         use windows_sys::Win32::NetworkManagement::IpHelper::{
             DeleteIpForwardEntry2, FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
         };
-        use windows_sys::Win32::Networking::WinSock::AF_INET;
+        use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
+        // IPv4 purge
         let mut table_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
         if GetIpForwardTable2(AF_INET, &mut table_ptr) == 0 && !table_ptr.is_null() {
             let num_entries = (*table_ptr).NumEntries as usize;
             let rows_slice = std::slice::from_raw_parts((*table_ptr).Table.as_ptr(), num_entries);
             let mut purged_count = 0;
             for row in rows_slice {
-                if row.DestinationPrefix.PrefixLength == 8 {
-                    let first_octet = row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_un_b.s_b1;
-                    if (1..=223).contains(&first_octet)
-                        && first_octet != 10
-                        && first_octet != 127
-                    {
-                        let res = DeleteIpForwardEntry2(row as *const _);
-                        if res == 0 {
-                            purged_count += 1;
-                        }
+                let plen = row.DestinationPrefix.PrefixLength;
+                let first_octet = row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_un_b.s_b1;
+                let has_gw = row.NextHop.Ipv4.sin_addr.S_un.S_addr != 0;
+
+                // Delete /8, /1, or dynamically added /32 routes that have a next-hop gateway
+                let is_removable = (plen == 8 && (1..=223).contains(&first_octet) && first_octet != 10 && first_octet != 127)
+                    || (plen == 1)
+                    || (plen == 32 && has_gw && first_octet != 127 && first_octet != 255);
+
+                if is_removable {
+                    if DeleteIpForwardEntry2(row as *const _) == 0 {
+                        purged_count += 1;
                     }
                 }
             }
             FreeMibTable(table_ptr as *const _);
             if purged_count > 0 {
-                info!("Purged {} conflicting /8 static routes via IP Helper API", purged_count);
+                info!("Purged {} conflicting IPv4 routes via IP Helper API", purged_count);
+            }
+        }
+
+        // IPv6 purge
+        let mut table_v6_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+        if GetIpForwardTable2(AF_INET6, &mut table_v6_ptr) == 0 && !table_v6_ptr.is_null() {
+            let num_entries = (*table_v6_ptr).NumEntries as usize;
+            let rows_slice = std::slice::from_raw_parts((*table_v6_ptr).Table.as_ptr(), num_entries);
+            let mut purged_v6 = 0;
+            for row in rows_slice {
+                let plen = row.DestinationPrefix.PrefixLength;
+                // Delete /4 half-spaces or dynamically added /128 routes with gateways
+                if plen == 4 || plen == 128 {
+                    let b0 = row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte[0];
+                    let b1 = row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte[1];
+                    let is_link_local = b0 == 0xfe && (b1 & 0xc0) == 0x80;
+                    let is_loopback = row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte[15] == 1
+                        && row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte[..15].iter().all(|&b| b == 0);
+
+                    if !is_link_local && !is_loopback {
+                        if DeleteIpForwardEntry2(row as *const _) == 0 {
+                            purged_v6 += 1;
+                        }
+                    }
+                }
+            }
+            FreeMibTable(table_v6_ptr as *const _);
+            if purged_v6 > 0 {
+                info!("Purged {} conflicting IPv6 routes via IP Helper API", purged_v6);
             }
         }
     }
-
-    // PowerShell fallback removal to guarantee no /8 routes remain
-    let _ = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-NetRoute | Where-Object { $_.DestinationPrefix -like '*/8' -and $_.DestinationPrefix -notlike '10.*' -and $_.DestinationPrefix -notlike '127.*' } | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
 }
 
 impl Drop for RouteManager {

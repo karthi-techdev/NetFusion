@@ -698,20 +698,26 @@ async fn run_bonding_engine(
                         continue;
                     }
 
-                    total_rx += p.rx_bytes;
-                    total_tx += p.tx_bytes;
+                    let proxy_rx = proxy::PROXY_PATH_RX_BYTES.get(p.path_id as usize).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0);
+                    let proxy_tx = proxy::PROXY_PATH_TX_BYTES.get(p.path_id as usize).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0);
 
-                    let prev_rx = *prev_path_rx.get(&p.path_id).unwrap_or(&p.rx_bytes);
-                    let prev_tx = *prev_path_tx.get(&p.path_id).unwrap_or(&p.tx_bytes);
+                    let effective_p_rx = p.rx_bytes + proxy_rx;
+                    let effective_p_tx = p.tx_bytes + proxy_tx;
 
-                    let rx_diff = p.rx_bytes.saturating_sub(prev_rx) as f64;
-                    let tx_diff = p.tx_bytes.saturating_sub(prev_tx) as f64;
+                    total_rx += effective_p_rx;
+                    total_tx += effective_p_tx;
+
+                    let prev_rx = *prev_path_rx.get(&p.path_id).unwrap_or(&effective_p_rx);
+                    let prev_tx = *prev_path_tx.get(&p.path_id).unwrap_or(&effective_p_tx);
+
+                    let rx_diff = effective_p_rx.saturating_sub(prev_rx) as f64;
+                    let tx_diff = effective_p_tx.saturating_sub(prev_tx) as f64;
 
                     let path_rx_bps = (rx_diff * 8.0) / elapsed_sec;
                     let path_tx_bps = (tx_diff * 8.0) / elapsed_sec;
 
-                    prev_path_rx.insert(p.path_id, p.rx_bytes);
-                    prev_path_tx.insert(p.path_id, p.tx_bytes);
+                    prev_path_rx.insert(p.path_id, effective_p_rx);
+                    prev_path_tx.insert(p.path_id, effective_p_tx);
 
                     // Cross-reference with real-time OS physical network adapter telemetry
                     let if_idx = path_if_indices.read().get(&p.path_id).copied().unwrap_or(0);
