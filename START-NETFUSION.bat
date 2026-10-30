@@ -61,8 +61,8 @@ echo [*] Launching NetFusion Bonding Engine and Live Dashboard...
 echo.
 
 :: Start NetFusion (Tray app with low memory usage and live network speed)
-if exist "%~dp0NetFusion-Setup.exe" (
-    start "" "%~dp0NetFusion-Setup.exe"
+if exist "%~dp0NetFusion-Portable.exe" (
+    start "" "%~dp0NetFusion-Portable.exe"
 ) else if exist "%~dp0target\release\NetFusion.exe" (
     start "" "%~dp0target\release\NetFusion.exe"
 ) else (

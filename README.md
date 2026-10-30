@@ -101,19 +101,19 @@ For single-threaded TCP connections that cannot be parallelized across sockets, 
 
 ## 🚀 Quick Start
 
-### Option A: 1-Click Installer (Recommended)
-1. Download [**`NetFusion-Setup.exe`**](file:///c:/code-projects/NetFusion/NetFusion-Setup.exe) from the latest release or root directory.
-2. Run the installer:
-   * Select whether you want NetFusion to start automatically with Windows.
-   * NetFusion will silently install to `%LOCALAPPDATA%\Programs\NetFusion`, create a Desktop shortcut, and launch straight into the **Windows System Tray**.
-3. Click the NetFusion icon in your system tray to inspect your connected networks, see live speed metrics, or click **🚀 Test Combined Speed Now (5s)** to watch both connections bond!
+### Option A: Portable Standalone (Recommended)
+1. Download [**`NetFusion-Portable.exe`**](https://github.com/karthi-techdev/NetFusion/releases/download/v1.0.0/NetFusion-Portable.exe) from the [Latest Release](https://github.com/karthi-techdev/NetFusion/releases).
+2. Double-click **`NetFusion-Portable.exe`**:
+   * NetFusion immediately launches into your **Windows System Tray** with zero setup or installation needed.
+   * To have NetFusion start automatically with Windows, simply click **✔ Start Automatically with Windows** in the tray menu.
+3. Click the NetFusion icon in your system tray to inspect your connected networks, see live speed metrics, or click **🚀 Test Combined Speed Now (5s)** to watch all connections bond!
 
 ### Option B: Build from Source
 Ensure you have **Rust 1.80+** and MinGW-w64 installed:
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/NetFusion.git
+git clone https://github.com/karthi-techdev/NetFusion.git
 cd NetFusion
 
 # Build release binaries
