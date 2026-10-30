@@ -47,6 +47,9 @@ struct CliArgs {
 
     #[arg(long)]
     dump_adapters: bool,
+
+    #[arg(long)]
+    no_elevate: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -66,10 +69,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let adapters = adapter::discover_adapters()?;
         for a in adapters {
             if a.is_eligible_wan() {
-                println!("[WAN] {:?} | Name: '{}' | Network: '{}' | IP: {:?}", a.kind, a.name, a.network_name, a.ipv4_addr);
+                println!("[WAN] {:?} | Name: '{}' | Network: '{}' | IPv4: {:?} | IPv6: {:?}", a.kind, a.name, a.network_name, a.ipv4_addr, a.ipv6_addr);
             }
         }
         return Ok(());
+    }
+
+    // Auto-elevation: Windows routing table modifications and Weak Host Model strictly require Administrator privileges.
+    if !is_elevated() && !args.no_elevate && args.watchdog.is_none() {
+        if let Ok(current_exe) = std::env::current_exe() {
+            use std::os::windows::ffi::OsStrExt;
+            let wide_exe: Vec<u16> = current_exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+            let wide_op: Vec<u16> = std::ffi::OsStr::new("runas").encode_wide().chain(std::iter::once(0)).collect();
+            let args_list: Vec<String> = std::env::args().skip(1).collect();
+            let args_str = args_list.join(" ");
+            let wide_args: Vec<u16> = std::ffi::OsStr::new(&args_str).encode_wide().chain(std::iter::once(0)).collect();
+
+            let h_inst = unsafe {
+                windows_sys::Win32::UI::Shell::ShellExecuteW(
+                    0,
+                    wide_op.as_ptr(),
+                    wide_exe.as_ptr(),
+                    if args_str.is_empty() { std::ptr::null() } else { wide_args.as_ptr() },
+                    std::ptr::null(),
+                    windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+                )
+            };
+            if (h_inst as usize) > 32 {
+                info!("Spawned elevated NetFusion process with Administrator privileges. Exiting non-elevated instance.");
+                return Ok(());
+            }
+        }
     }
 
     // Watchdog mode: lightweight detached process that monitors parent NetFusion PID.
@@ -192,6 +222,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn is_elevated() -> bool {
+    unsafe {
+        let mut token = 0;
+        if windows_sys::Win32::System::Threading::OpenProcessToken(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            windows_sys::Win32::Security::TOKEN_QUERY,
+            &mut token,
+        ) != 0 {
+            let mut elevation = windows_sys::Win32::Security::TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut size = std::mem::size_of::<windows_sys::Win32::Security::TOKEN_ELEVATION>() as u32;
+            let res = windows_sys::Win32::Security::GetTokenInformation(
+                token,
+                windows_sys::Win32::Security::TokenElevation,
+                &mut elevation as *mut _ as *mut _,
+                size,
+                &mut size,
+            );
+            windows_sys::Win32::Foundation::CloseHandle(token);
+            res != 0 && elevation.TokenIsElevated != 0
+        } else {
+            false
+        }
+    }
+}
+
 fn get_app_dir() -> PathBuf {
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
         let dir = PathBuf::from(local_app_data).join("NetFusion");
@@ -279,27 +334,46 @@ async fn run_bonding_engine(
             match WanPathSocket::bind(path_id, &wan.name, local_ip, server_sockaddr) {
                 Ok(wan_sock) => {
                     wan_sockets.push(Arc::new(wan_sock));
-                    wan_interfaces.push((path_id, wan.name.clone(), local_ip, wan.if_index));
-                    let mut pm = PathMetrics::new(path_id, wan.name.clone(), local_ip.to_string());
-                    pm.network_name = wan.network_name.clone();
-                    // Balanced fair capacity weighting: ensures multi-WAN connections (Ethernet and WiFi)
-                    // are actively and concurrently utilized without starvation.
-                    pm.capacity_weight = 1.0;
-                    scheduler.add_path(pm);
                 }
                 Err(e) => {
                     error!("Failed to bind WAN socket for {}: {}", wan.name, e);
                 }
             }
         }
+        if wan.ipv4_addr.is_some() || wan.ipv6_addr.is_some() {
+            wan_interfaces.push(proxy::WanInterfaceInfo {
+                path_id,
+                name: wan.name.clone(),
+                ipv4: wan.ipv4_addr,
+                ipv6: wan.ipv6_addr,
+                if_index: wan.if_index,
+            });
+            let local_display = wan.ipv4_addr
+                .map(|ip| ip.to_string())
+                .or_else(|| wan.ipv6_addr.map(|ip| ip.to_string()))
+                .unwrap_or_default();
+            let mut pm = PathMetrics::new(path_id, wan.name.clone(), local_display);
+            pm.network_name = wan.network_name.clone();
+            // Balanced fair capacity weighting: ensures multi-WAN connections (Ethernet and WiFi)
+            // are actively and concurrently utilized without starvation.
+            pm.capacity_weight = 1.0;
+            pm.is_alive = true;
+            scheduler.add_path(pm);
+        }
     }
 
-    if wan_sockets.is_empty() {
+    if wan_interfaces.is_empty() {
         warn!("No physical WAN interfaces available! Running in loopback/testing fallback mode...");
         let loopback_ip = Ipv4Addr::new(127, 0, 0, 1);
         let fallback_sock = WanPathSocket::bind(0, "LoopbackWAN", loopback_ip, server_sockaddr)?;
         wan_sockets.push(Arc::new(fallback_sock));
-        wan_interfaces.push((0, "LoopbackWAN".to_string(), loopback_ip, 1));
+        wan_interfaces.push(proxy::WanInterfaceInfo {
+            path_id: 0,
+            name: "LoopbackWAN".to_string(),
+            ipv4: Some(loopback_ip),
+            ipv6: None,
+            if_index: 1,
+        });
         scheduler.add_path(PathMetrics::new(0, "LoopbackWAN".to_string(), "127.0.0.1".to_string()));
     }
 
@@ -577,13 +651,19 @@ async fn run_bonding_engine(
                         let p_indices = path_if_indices.read();
                         let mut dispatcher_list = Vec::new();
                         for w in &active_wans {
-                            if let Some(ip) = w.ipv4_addr {
+                            if w.ipv4_addr.is_some() || w.ipv6_addr.is_some() {
                                 let pid = p_indices
                                     .iter()
                                     .find(|(_, &idx)| idx == w.if_index)
                                     .map(|(&p, _)| p)
                                     .unwrap_or(0);
-                                dispatcher_list.push((pid, w.name.clone(), ip, w.if_index));
+                                dispatcher_list.push(proxy::WanInterfaceInfo {
+                                    path_id: pid,
+                                    name: w.name.clone(),
+                                    ipv4: w.ipv4_addr,
+                                    ipv6: w.ipv6_addr,
+                                    if_index: w.if_index,
+                                });
                             }
                         }
                         if !dispatcher_list.is_empty() {

@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::ptr::null_mut;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -8,7 +8,7 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2, MIB_IF_TABLE2,
 };
 use windows_sys::Win32::NetworkManagement::WiFi::*;
-use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR_IN};
+use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterKind {
@@ -29,7 +29,9 @@ pub struct NetworkInterface {
     pub kind: AdapterKind,
     pub is_up: bool,
     pub ipv4_addr: Option<Ipv4Addr>,
+    pub ipv6_addr: Option<Ipv6Addr>,
     pub gateway: Option<Ipv4Addr>,
+    pub ipv6_gateway: Option<Ipv6Addr>,
     pub speed_bps: u64,
     pub isp_label: String,
     pub network_name: String,
@@ -38,8 +40,8 @@ pub struct NetworkInterface {
 impl NetworkInterface {
     pub fn is_eligible_wan(&self) -> bool {
         self.is_up
-            && self.ipv4_addr.is_some()
-            && self.gateway.is_some()
+            && (self.ipv4_addr.is_some() || self.ipv6_addr.is_some())
+            && (self.gateway.is_some() || self.ipv6_gateway.is_some())
             && self.kind != AdapterKind::Virtual
             && !self.name.to_lowercase().contains("wintun")
             && !self.name.to_lowercase().contains("loopback")
@@ -149,36 +151,62 @@ pub fn discover_adapters() -> Result<Vec<NetworkInterface>, String> {
             }
         };
 
-        // Extract first IPv4 unicast address
+        // Extract unicast addresses (both IPv4 and IPv6)
         let mut ipv4_addr = None;
+        let mut ipv6_addr = None;
         let mut unicast_ptr = adapter.FirstUnicastAddress;
         while !unicast_ptr.is_null() {
             let unicast = unsafe { &*unicast_ptr };
             let sockaddr = unicast.Address.lpSockaddr;
-            if !sockaddr.is_null() && unsafe { (*sockaddr).sa_family } == AF_INET as u16 {
-                let sockaddr_in = sockaddr as *const SOCKADDR_IN;
-                let sin_addr = unsafe { (*sockaddr_in).sin_addr };
-                let octets = unsafe { sin_addr.S_un.S_addr }.to_ne_bytes();
-                let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
-                if !ip.is_loopback() {
-                    ipv4_addr = Some(ip);
-                    break;
+            if !sockaddr.is_null() {
+                let family = unsafe { (*sockaddr).sa_family };
+                if family == AF_INET as u16 && ipv4_addr.is_none() {
+                    let sockaddr_in = sockaddr as *const SOCKADDR_IN;
+                    let sin_addr = unsafe { (*sockaddr_in).sin_addr };
+                    let octets = unsafe { sin_addr.S_un.S_addr }.to_ne_bytes();
+                    let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
+                    if !ip.is_loopback() {
+                        ipv4_addr = Some(ip);
+                    }
+                } else if family == AF_INET6 as u16 && ipv6_addr.is_none() {
+                    let sockaddr_in6 = sockaddr as *const SOCKADDR_IN6;
+                    let octets: [u8; 16] = unsafe { std::mem::transmute((*sockaddr_in6).sin6_addr) };
+                    let ip6 = Ipv6Addr::from(octets);
+                    if !ip6.is_loopback() && (ip6.segments()[0] & 0xffc0) != 0xfe80 {
+                        ipv6_addr = Some(ip6);
+                    }
                 }
+            }
+            if ipv4_addr.is_some() && ipv6_addr.is_some() {
+                break;
             }
             unicast_ptr = unicast.Next;
         }
 
-        // Extract first IPv4 default gateway
+        // Extract default gateways (both IPv4 and IPv6)
         let mut gateway = None;
+        let mut ipv6_gateway = None;
         let mut gw_ptr = adapter.FirstGatewayAddress;
         while !gw_ptr.is_null() {
             let gw = unsafe { &*gw_ptr };
             let sockaddr = gw.Address.lpSockaddr;
-            if !sockaddr.is_null() && unsafe { (*sockaddr).sa_family } == AF_INET as u16 {
-                let sockaddr_in = sockaddr as *const SOCKADDR_IN;
-                let sin_addr = unsafe { (*sockaddr_in).sin_addr };
-                let octets = unsafe { sin_addr.S_un.S_addr }.to_ne_bytes();
-                gateway = Some(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]));
+            if !sockaddr.is_null() {
+                let family = unsafe { (*sockaddr).sa_family };
+                if family == AF_INET as u16 && gateway.is_none() {
+                    let sockaddr_in = sockaddr as *const SOCKADDR_IN;
+                    let sin_addr = unsafe { (*sockaddr_in).sin_addr };
+                    let octets = unsafe { sin_addr.S_un.S_addr }.to_ne_bytes();
+                    gateway = Some(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]));
+                } else if family == AF_INET6 as u16 && ipv6_gateway.is_none() {
+                    let sockaddr_in6 = sockaddr as *const SOCKADDR_IN6;
+                    let octets: [u8; 16] = unsafe { std::mem::transmute((*sockaddr_in6).sin6_addr) };
+                    let ip6 = Ipv6Addr::from(octets);
+                    if !ip6.is_loopback() {
+                        ipv6_gateway = Some(ip6);
+                    }
+                }
+            }
+            if gateway.is_some() && ipv6_gateway.is_some() {
                 break;
             }
             gw_ptr = gw.Next;
@@ -215,7 +243,9 @@ pub fn discover_adapters() -> Result<Vec<NetworkInterface>, String> {
             kind,
             is_up,
             ipv4_addr,
+            ipv6_addr,
             gateway,
+            ipv6_gateway,
             speed_bps,
             isp_label,
             network_name,

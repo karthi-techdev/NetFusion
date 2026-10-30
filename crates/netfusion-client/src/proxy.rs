@@ -2,12 +2,22 @@ use log::{info, warn};
 use netfusion_core::scheduler::AdaptiveScheduler;
 use parking_lot::RwLock;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::windows::io::{AsRawSocket, FromRawSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct WanInterfaceInfo {
+    pub path_id: u8,
+    pub name: String,
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
+    pub if_index: u32,
+}
 
 /// High-performance local Multi-WAN dispatcher proxy
 /// Automatically distributes parallel web connections (Google speed test, Chrome, Edge)
@@ -15,7 +25,7 @@ use tokio::net::{TcpListener, TcpStream};
 pub struct LocalDispatcher {
     listen_port: u16,
     scheduler: Arc<RwLock<AdaptiveScheduler>>,
-    wan_interfaces: Arc<RwLock<Vec<(u8, String, Ipv4Addr, u32)>>>,
+    wan_interfaces: Arc<RwLock<Vec<WanInterfaceInfo>>>,
     bonding_active: Arc<AtomicBool>,
 }
 
@@ -23,7 +33,7 @@ impl LocalDispatcher {
     pub fn new(
         listen_port: u16,
         scheduler: Arc<RwLock<AdaptiveScheduler>>,
-        wan_interfaces: Arc<RwLock<Vec<(u8, String, Ipv4Addr, u32)>>>,
+        wan_interfaces: Arc<RwLock<Vec<WanInterfaceInfo>>>,
         bonding_active: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -65,7 +75,7 @@ impl LocalDispatcher {
 async fn handle_client(
     mut client: TcpStream,
     scheduler: Arc<RwLock<AdaptiveScheduler>>,
-    wan_interfaces: Arc<RwLock<Vec<(u8, String, Ipv4Addr, u32)>>>,
+    wan_interfaces: Arc<RwLock<Vec<WanInterfaceInfo>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = vec![0u8; 4096];
     let n = client.read(&mut buf).await?;
@@ -83,16 +93,7 @@ async fn handle_client(
             return Ok(());
         }
         let target = parts[1];
-        let target_host = if let Some(idx) = target.find(':') {
-            &target[..idx]
-        } else {
-            target
-        };
-        let target_port: u16 = if let Some(idx) = target.find(':') {
-            target[idx + 1..].parse().unwrap_or(443)
-        } else {
-            443
-        };
+        let (target_host, target_port) = parse_host_port(target, 443);
 
         // Select WAN path using fair round-robin alternation to strictly utilize ALL connections simultaneously
         let path_id = {
@@ -103,107 +104,33 @@ async fn handle_client(
         let target_wan = {
             let wans = wan_interfaces.read();
             wans.iter()
-                .find(|(id, _, _, _)| *id == path_id)
+                .find(|w| w.path_id == path_id)
                 .cloned()
                 .or_else(|| wans.first().cloned())
         };
 
-        if let Some((pid, _name, local_ip, if_index)) = target_wan {
-            let target_addr_opt = match tokio::time::timeout(
+        if let Some(wan) = target_wan {
+            let target_addrs: Vec<SocketAddr> = match tokio::time::timeout(
                 std::time::Duration::from_millis(3000),
                 tokio::net::lookup_host(format!("{}:{}", target_host, target_port)),
             ).await {
-                Ok(Ok(mut it)) => it.find(|a| a.is_ipv4()),
-                _ => None,
+                Ok(Ok(iter)) => iter.collect(),
+                _ => Vec::new(),
             };
 
-            if let Some(target_sockaddr) = target_addr_opt {
-                // Attempt connection via chosen interface with 2.5s timeout
-                let mut connect_res = match tokio::time::timeout(
-                    std::time::Duration::from_millis(2500),
-                    bind_and_connect(local_ip, if_index, target_sockaddr),
-                ).await {
-                    Ok(res) => res,
-                    Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Interface connect timeout")),
-                };
-                let mut active_pid = pid;
+            let connect_res = connect_with_failover(&wan, &target_addrs, &wan_interfaces).await;
 
-                // Failover: if connection on this path fails, try other available interfaces
-                if connect_res.is_err() {
-                    let wans = wan_interfaces.read().clone();
-                    for (alt_pid, _, alt_ip, alt_idx) in &wans {
-                        if *alt_pid != pid {
-                            let alt_res = match tokio::time::timeout(
-                                std::time::Duration::from_millis(2500),
-                                bind_and_connect(*alt_ip, *alt_idx, target_sockaddr),
-                            ).await {
-                                Ok(res) => res,
-                                Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Interface connect timeout")),
-                            };
-                            if let Ok(stream) = alt_res {
-                                connect_res = Ok(stream);
-                                active_pid = *alt_pid;
-                                break;
-                            }
-                        }
-                    }
+            match connect_res {
+                Ok((remote_stream, active_pid)) => {
+                    client
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await?;
+
+                    splice_bidirectional(client, remote_stream, scheduler, active_pid).await;
                 }
-
-                match connect_res {
-                    Ok(remote_stream) => {
-                        // Acknowledge connection established to browser
-                        client
-                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                            .await?;
-
-                        // Splice bidirectionally with real-time byte tracking per interface
-                        let (mut cr, mut cw) = client.into_split();
-                        let (mut rr, mut rw) = remote_stream.into_split();
-
-                        let sched1 = scheduler.clone();
-                        let t1 = tokio::spawn(async move {
-                            let mut temp_buf = vec![0u8; 32768];
-                            while let Ok(read_bytes) = cr.read(&mut temp_buf).await {
-                                if read_bytes == 0 {
-                                    break;
-                                }
-                                if rw.write_all(&temp_buf[..read_bytes]).await.is_err() {
-                                    break;
-                                }
-                                let mut s = sched1.write();
-                                if let Some(p) = s.paths_mut().iter_mut().find(|p| p.path_id == active_pid) {
-                                    p.tx_bytes += read_bytes as u64;
-                                    p.tx_packets += 1;
-                                }
-                            }
-                        });
-
-                        let sched2 = scheduler.clone();
-                        let t2 = tokio::spawn(async move {
-                            let mut temp_buf = vec![0u8; 32768];
-                            while let Ok(read_bytes) = rr.read(&mut temp_buf).await {
-                                if read_bytes == 0 {
-                                    break;
-                                }
-                                if cw.write_all(&temp_buf[..read_bytes]).await.is_err() {
-                                    break;
-                                }
-                                let mut s = sched2.write();
-                                if let Some(p) = s.paths_mut().iter_mut().find(|p| p.path_id == active_pid) {
-                                    p.rx_bytes += read_bytes as u64;
-                                    p.rx_packets += 1;
-                                }
-                            }
-                        });
-
-                        let _ = tokio::join!(t1, t2);
-                    }
-                    Err(_e) => {
-                        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                    }
+                Err(_) => {
+                    let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 }
-            } else {
-                let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
             }
         } else {
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
@@ -219,16 +146,7 @@ async fn handle_client(
         }
 
         if let Some(host) = host_header {
-            let target_host = if let Some(idx) = host.find(':') {
-                host[..idx].to_string()
-            } else {
-                host.clone()
-            };
-            let target_port: u16 = if let Some(idx) = host.find(':') {
-                host[idx + 1..].parse().unwrap_or(80)
-            } else {
-                80
-            };
+            let (target_host, target_port) = parse_host_port(&host, 80);
 
             let path_id = {
                 let mut sched = scheduler.write();
@@ -238,104 +156,33 @@ async fn handle_client(
             let target_wan = {
                 let wans = wan_interfaces.read();
                 wans.iter()
-                    .find(|(id, _, _, _)| *id == path_id)
+                    .find(|w| w.path_id == path_id)
                     .cloned()
                     .or_else(|| wans.first().cloned())
             };
 
-            if let Some((pid, _name, local_ip, if_index)) = target_wan {
-                let target_addr_opt = match tokio::time::timeout(
+            if let Some(wan) = target_wan {
+                let target_addrs: Vec<SocketAddr> = match tokio::time::timeout(
                     std::time::Duration::from_millis(3000),
                     tokio::net::lookup_host(format!("{}:{}", target_host, target_port)),
                 ).await {
-                    Ok(Ok(mut it)) => it.find(|a| a.is_ipv4()),
-                    _ => None,
+                    Ok(Ok(iter)) => iter.collect(),
+                    _ => Vec::new(),
                 };
 
-                if let Some(target_sockaddr) = target_addr_opt {
-                    let mut connect_res = match tokio::time::timeout(
-                        std::time::Duration::from_millis(2500),
-                        bind_and_connect(local_ip, if_index, target_sockaddr),
-                    ).await {
-                        Ok(res) => res,
-                        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Interface connect timeout")),
-                    };
-                    let mut active_pid = pid;
+                let connect_res = connect_with_failover(&wan, &target_addrs, &wan_interfaces).await;
 
-                    if connect_res.is_err() {
-                        let wans = wan_interfaces.read().clone();
-                        for (alt_pid, _, alt_ip, alt_idx) in &wans {
-                            if *alt_pid != pid {
-                                let alt_res = match tokio::time::timeout(
-                                    std::time::Duration::from_millis(2500),
-                                    bind_and_connect(*alt_ip, *alt_idx, target_sockaddr),
-                                ).await {
-                                    Ok(res) => res,
-                                    Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Interface connect timeout")),
-                                };
-                                if let Ok(stream) = alt_res {
-                                    connect_res = Ok(stream);
-                                    active_pid = *alt_pid;
-                                    break;
-                                }
-                            }
+                if let Ok((mut remote_stream, active_pid)) = connect_res {
+                    remote_stream.write_all(&buf[..n]).await?;
+                    {
+                        let mut s = scheduler.write();
+                        if let Some(p) = s.paths_mut().iter_mut().find(|p| p.path_id == active_pid) {
+                            p.tx_bytes += n as u64;
+                            p.tx_packets += 1;
                         }
                     }
 
-                    if let Ok(mut remote_stream) = connect_res {
-                        // Forward original request
-                        remote_stream.write_all(&buf[..n]).await?;
-                        {
-                            let mut s = scheduler.write();
-                            if let Some(p) = s.paths_mut().iter_mut().find(|p| p.path_id == active_pid) {
-                                p.tx_bytes += n as u64;
-                                p.tx_packets += 1;
-                            }
-                        }
-
-                        let (mut cr, mut cw) = client.into_split();
-                        let (mut rr, mut rw) = remote_stream.into_split();
-
-                        let sched1 = scheduler.clone();
-                        let t1 = tokio::spawn(async move {
-                            let mut temp_buf = vec![0u8; 32768];
-                            while let Ok(read_bytes) = cr.read(&mut temp_buf).await {
-                                if read_bytes == 0 {
-                                    break;
-                                }
-                                if rw.write_all(&temp_buf[..read_bytes]).await.is_err() {
-                                    break;
-                                }
-                                let mut s = sched1.write();
-                                if let Some(p) = s.paths_mut().iter_mut().find(|p| p.path_id == active_pid) {
-                                    p.tx_bytes += read_bytes as u64;
-                                    p.tx_packets += 1;
-                                }
-                            }
-                        });
-
-                        let sched2 = scheduler.clone();
-                        let t2 = tokio::spawn(async move {
-                            let mut temp_buf = vec![0u8; 32768];
-                            while let Ok(read_bytes) = rr.read(&mut temp_buf).await {
-                                if read_bytes == 0 {
-                                    break;
-                                }
-                                if cw.write_all(&temp_buf[..read_bytes]).await.is_err() {
-                                    break;
-                                }
-                                let mut s = sched2.write();
-                                if let Some(p) = s.paths_mut().iter_mut().find(|p| p.path_id == active_pid) {
-                                    p.rx_bytes += read_bytes as u64;
-                                    p.rx_packets += 1;
-                                }
-                            }
-                        });
-
-                        let _ = tokio::join!(t1, t2);
-                    } else {
-                        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-                    }
+                    splice_bidirectional(client, remote_stream, scheduler, active_pid).await;
                 } else {
                     let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 }
@@ -348,41 +195,202 @@ async fn handle_client(
     Ok(())
 }
 
+fn parse_host_port(target: &str, default_port: u16) -> (String, u16) {
+    if target.starts_with('[') {
+        if let Some(end_bracket) = target.find(']') {
+            let host = &target[1..end_bracket];
+            let port = if let Some(colon) = target[end_bracket..].find(':') {
+                target[end_bracket + colon + 1..].parse().unwrap_or(default_port)
+            } else {
+                default_port
+            };
+            return (host.to_string(), port);
+        }
+    }
+    if let Some(colon) = target.rfind(':') {
+        let host = &target[..colon];
+        let port = target[colon + 1..].parse().unwrap_or(default_port);
+        (host.to_string(), port)
+    } else {
+        (target.to_string(), default_port)
+    }
+}
+
+async fn connect_with_failover(
+    wan: &WanInterfaceInfo,
+    target_addrs: &[SocketAddr],
+    wan_interfaces: &Arc<RwLock<Vec<WanInterfaceInfo>>>,
+) -> std::io::Result<(TcpStream, u8)> {
+    if target_addrs.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "No resolved IP addresses"));
+    }
+
+    // Try chosen interface first
+    if let Ok(stream) = try_wan_connect(wan, target_addrs).await {
+        return Ok((stream, wan.path_id));
+    }
+
+    // Failover: Try any other available WAN interfaces
+    let wans = wan_interfaces.read().clone();
+    for alt_wan in &wans {
+        if alt_wan.path_id != wan.path_id {
+            if let Ok(stream) = try_wan_connect(alt_wan, target_addrs).await {
+                return Ok((stream, alt_wan.path_id));
+            }
+        }
+    }
+
+    Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "All WAN interfaces failed to connect"))
+}
+
+async fn try_wan_connect(
+    wan: &WanInterfaceInfo,
+    target_addrs: &[SocketAddr],
+) -> std::io::Result<TcpStream> {
+    // Filter candidates according to WAN interface capabilities
+    let mut candidates: Vec<SocketAddr> = target_addrs
+        .iter()
+        .copied()
+        .filter(|a| {
+            (a.is_ipv4() && wan.ipv4.is_some()) || (a.is_ipv6() && wan.ipv6.is_some())
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Interface lacks matching IP version"));
+    }
+
+    // Strict dual-stack support: prioritize IPv6 if WAN has native IPv6!
+    if wan.ipv6.is_some() {
+        candidates.sort_by_key(|a| if a.is_ipv6() { 0 } else { 1 });
+    }
+
+    for remote in candidates {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(2500),
+            bind_and_connect(wan.ipv4, wan.ipv6, wan.if_index, remote),
+        ).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            _ => continue,
+        }
+    }
+
+    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Interface connect failed"))
+}
+
+async fn splice_bidirectional(
+    client: TcpStream,
+    remote: TcpStream,
+    scheduler: Arc<RwLock<AdaptiveScheduler>>,
+    active_pid: u8,
+) {
+    let (mut cr, mut cw) = client.into_split();
+    let (mut rr, mut rw) = remote.into_split();
+
+    let sched1 = scheduler.clone();
+    let t1 = tokio::spawn(async move {
+        let mut temp_buf = vec![0u8; 32768];
+        while let Ok(read_bytes) = cr.read(&mut temp_buf).await {
+            if read_bytes == 0 {
+                break;
+            }
+            if rw.write_all(&temp_buf[..read_bytes]).await.is_err() {
+                break;
+            }
+            let mut s = sched1.write();
+            if let Some(p) = s.paths_mut().iter_mut().find(|p| p.path_id == active_pid) {
+                p.tx_bytes += read_bytes as u64;
+                p.tx_packets += 1;
+            }
+        }
+    });
+
+    let sched2 = scheduler.clone();
+    let t2 = tokio::spawn(async move {
+        let mut temp_buf = vec![0u8; 32768];
+        while let Ok(read_bytes) = rr.read(&mut temp_buf).await {
+            if read_bytes == 0 {
+                break;
+            }
+            if cw.write_all(&temp_buf[..read_bytes]).await.is_err() {
+                break;
+            }
+            let mut s = sched2.write();
+            if let Some(p) = s.paths_mut().iter_mut().find(|p| p.path_id == active_pid) {
+                p.rx_bytes += read_bytes as u64;
+                p.rx_packets += 1;
+            }
+        }
+    });
+
+    let _ = tokio::join!(t1, t2);
+}
+
 /// Asynchronously bind a TCP socket strictly to a physical network adapter's local IP and interface index
-/// using Winsock IP_UNICAST_IF to guarantee traffic routes directly through the chosen physical adapter.
+/// using Winsock IP_UNICAST_IF / IPV6_UNICAST_IF to guarantee traffic routes directly through the chosen physical adapter.
 async fn bind_and_connect(
-    local_ip: Ipv4Addr,
+    local_ipv4: Option<Ipv4Addr>,
+    local_ipv6: Option<Ipv6Addr>,
     if_index: u32,
     remote_addr: SocketAddr,
 ) -> std::io::Result<TcpStream> {
-    let domain = if remote_addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
+    let domain = match remote_addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
     };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_nonblocking(true)?;
 
-    // 1. Force outbound interface selection via IP_UNICAST_IF on Windows
-    // On Windows, if_index must be passed in network byte order (big-endian).
+    // 1. Force outbound interface selection via IP_UNICAST_IF / IPV6_UNICAST_IF on Windows
     if if_index > 0 {
-        let net_if_index = if_index.to_be();
         unsafe {
-            windows_sys::Win32::Networking::WinSock::setsockopt(
-                socket.as_raw_socket() as _,
-                0, // IPPROTO_IP
-                31, // IP_UNICAST_IF
-                &net_if_index as *const _ as *const u8,
-                std::mem::size_of::<u32>() as i32,
-            );
+            match remote_addr {
+                SocketAddr::V4(_) => {
+                    // On Windows, IP_UNICAST_IF requires if_index in network byte order (big-endian).
+                    let net_if_index = if_index.to_be();
+                    windows_sys::Win32::Networking::WinSock::setsockopt(
+                        socket.as_raw_socket() as _,
+                        0,  // IPPROTO_IP
+                        31, // IP_UNICAST_IF
+                        &net_if_index as *const _ as *const u8,
+                        std::mem::size_of::<u32>() as i32,
+                    );
+                }
+                SocketAddr::V6(_) => {
+                    // On Windows, IPV6_UNICAST_IF requires if_index in host byte order.
+                    let host_if_index = if_index;
+                    windows_sys::Win32::Networking::WinSock::setsockopt(
+                        socket.as_raw_socket() as _,
+                        41, // IPPROTO_IPV6
+                        31, // IPV6_UNICAST_IF
+                        &host_if_index as *const _ as *const u8,
+                        std::mem::size_of::<u32>() as i32,
+                    );
+                }
+            }
         }
     }
 
     // 2. Bind to source interface address
-    let bind_addr = SocketAddrV4::new(local_ip, 0);
-    if socket.bind(&bind_addr.into()).is_err() {
-        let any_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
-        let _ = socket.bind(&any_addr.into());
+    match remote_addr {
+        SocketAddr::V4(_) => {
+            let bind_addr = local_ipv4
+                .map(|ip| SocketAddrV4::new(ip, 0))
+                .unwrap_or(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+            if socket.bind(&bind_addr.into()).is_err() {
+                let any = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+                let _ = socket.bind(&any.into());
+            }
+        }
+        SocketAddr::V6(_) => {
+            let bind_addr = local_ipv6
+                .map(|ip| SocketAddrV6::new(ip, 0, 0, 0))
+                .unwrap_or(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0));
+            if socket.bind(&bind_addr.into()).is_err() {
+                let any = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
+                let _ = socket.bind(&any.into());
+            }
+        }
     }
 
     match socket.connect(&remote_addr.into()) {
@@ -400,7 +408,7 @@ async fn bind_and_connect(
                 unsafe { std::net::TcpStream::from_raw_socket(socket.as_raw_socket() as _) };
             std::mem::forget(socket);
             let stream = TcpStream::from_std(std_stream)?;
-            match tokio::time::timeout(std::time::Duration::from_millis(2000), stream.writable()).await {
+            match tokio::time::timeout(std::time::Duration::from_millis(2500), stream.writable()).await {
                 Ok(Ok(())) => {
                     if let Some(e) = stream.take_error()? {
                         return Err(e);
@@ -547,4 +555,3 @@ pub fn run_watchdog_loop(parent_pid: u32) {
         }
     }
 }
-

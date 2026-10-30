@@ -152,11 +152,25 @@ impl RouteManager {
 }
 
 /// Enable Weak Host Model on interface to allow sending & receiving through multiple WAN adapters
+/// for both IPv4 and IPv6 protocols
 pub fn enable_weak_host_model(if_index: u32) {
     let _ = Command::new("netsh")
         .args([
             "interface",
             "ipv4",
+            "set",
+            "interface",
+            &if_index.to_string(),
+            "weakhostsend=enabled",
+            "weakhostreceive=enabled",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    let _ = Command::new("netsh")
+        .args([
+            "interface",
+            "ipv6",
             "set",
             "interface",
             &if_index.to_string(),
@@ -179,6 +193,7 @@ pub fn purge_conflicting_kernel_routes() {
         if GetIpForwardTable2(AF_INET, &mut table_ptr) == 0 && !table_ptr.is_null() {
             let num_entries = (*table_ptr).NumEntries as usize;
             let rows_slice = std::slice::from_raw_parts((*table_ptr).Table.as_ptr(), num_entries);
+            let mut purged_count = 0;
             for row in rows_slice {
                 if row.DestinationPrefix.PrefixLength == 8 {
                     let first_octet = row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_un_b.s_b1;
@@ -186,13 +201,29 @@ pub fn purge_conflicting_kernel_routes() {
                         && first_octet != 10
                         && first_octet != 127
                     {
-                        let _ = DeleteIpForwardEntry2(row as *const _);
+                        let res = DeleteIpForwardEntry2(row as *const _);
+                        if res == 0 {
+                            purged_count += 1;
+                        }
                     }
                 }
             }
             FreeMibTable(table_ptr as *const _);
+            if purged_count > 0 {
+                info!("Purged {} conflicting /8 static routes via IP Helper API", purged_count);
+            }
         }
     }
+
+    // PowerShell fallback removal to guarantee no /8 routes remain
+    let _ = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-NetRoute | Where-Object { $_.DestinationPrefix -like '*/8' -and $_.DestinationPrefix -notlike '10.*' -and $_.DestinationPrefix -notlike '127.*' } | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
 }
 
 impl Drop for RouteManager {
