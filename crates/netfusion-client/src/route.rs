@@ -169,22 +169,29 @@ pub fn enable_weak_host_model(if_index: u32) {
 
 /// Purge any lingering /8 static routes that conflict with Multi-WAN socket binding
 pub fn purge_conflicting_kernel_routes() {
-    let mut del_commands = String::from("@echo off\r\n");
-    for octet in 1..=223u8 {
-        if octet == 10 || octet == 127 || octet == 169 || octet == 172 || octet == 192 {
-            continue;
-        }
-        del_commands.push_str(&format!("route DELETE {}.0.0.0 MASK 255.0.0.0 >nul 2>&1\r\n", octet));
-    }
+    unsafe {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            DeleteIpForwardEntry2, FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
+        };
+        use windows_sys::Win32::Networking::WinSock::AF_INET;
 
-    let temp_dir = std::env::temp_dir();
-    let bat_path = temp_dir.join(format!("netfusion_clean_routes_{}.bat", std::process::id()));
-    if let Ok(_) = std::fs::write(&bat_path, &del_commands) {
-        let _ = Command::new("cmd")
-            .args(["/C", bat_path.to_str().unwrap_or("")])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-        let _ = std::fs::remove_file(&bat_path);
+        let mut table_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+        if GetIpForwardTable2(AF_INET, &mut table_ptr) == 0 && !table_ptr.is_null() {
+            let num_entries = (*table_ptr).NumEntries as usize;
+            let rows_slice = std::slice::from_raw_parts((*table_ptr).Table.as_ptr(), num_entries);
+            for row in rows_slice {
+                if row.DestinationPrefix.PrefixLength == 8 {
+                    let first_octet = row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_un_b.s_b1;
+                    if (1..=223).contains(&first_octet)
+                        && first_octet != 10
+                        && first_octet != 127
+                    {
+                        let _ = DeleteIpForwardEntry2(row as *const _);
+                    }
+                }
+            }
+            FreeMibTable(table_ptr as *const _);
+        }
     }
 }
 

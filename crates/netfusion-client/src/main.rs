@@ -52,6 +52,16 @@ struct CliArgs {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = CliArgs::parse();
 
+    // 0. Setup file logging immediately so ANY startup error or status is captured
+    let log_path = get_app_dir().join("netfusion.log");
+    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .target(env_logger::Target::Pipe(Box::new(file)))
+            .try_init();
+    } else {
+        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).try_init();
+    }
+
     if args.dump_adapters {
         let adapters = adapter::discover_adapters()?;
         for a in adapters {
@@ -70,16 +80,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // 0. STRICT GUARANTEE: Reset any stale proxy and conflicting routes immediately on startup
+    // 1. Reset any stale proxy immediately on startup
     proxy::disable_windows_proxy();
-    route::purge_conflicting_kernel_routes();
 
-    // 1. Single instance mutex to prevent multiple conflicting instances
+    // 2. Single instance mutex to prevent multiple conflicting instances
     use std::os::windows::ffi::OsStrExt;
     let mutex_name: Vec<u16> = std::ffi::OsStr::new("Local\\NetFusionSingleInstanceMutex")
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    unsafe {
+        windows_sys::Win32::Foundation::SetLastError(0);
+    }
     let _h_mutex = unsafe {
         windows_sys::Win32::System::Threading::CreateMutexW(
             std::ptr::null(),
@@ -89,18 +101,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let last_err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
     if _h_mutex != 0 && last_err == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS {
-        info!("Another NetFusion instance is already running. Exiting duplicate instance.");
+        info!("Another NetFusion instance is already running (GetLastError={}). Exiting duplicate instance.", last_err);
         return Ok(());
     }
 
-    // 2. Strict crash/panic protection: disable proxy on ANY panic
+    // 3. Strict crash/panic protection: disable proxy on ANY panic
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         proxy::disable_windows_proxy();
         default_panic(info);
     }));
 
-    // 3. Strict termination protection: disable proxy on console close/logoff/shutdown
+    // 4. Strict termination protection: disable proxy on console close/logoff/shutdown
     unsafe {
         unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> windows_sys::Win32::Foundation::BOOL {
             match ctrl_type {
@@ -118,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(ctrl_handler), 1);
     }
 
-    // 4. Strict external watchdog: spawn an independent lightweight watchdog that monitors this process.
+    // 5. Strict external watchdog: spawn an independent lightweight watchdog that monitors this process.
     // Even if this process crashes, is killed by Task Manager, or terminates abnormally,
     // the watchdog restores direct internet access within milliseconds!
     if let Ok(current_exe) = std::env::current_exe() {
@@ -130,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .spawn();
     }
 
-    // 5. RAII drop guard for normal / unwind exits
+    // 6. RAII drop guard for normal / unwind exits
     struct SafeProxyCleanup;
     impl Drop for SafeProxyCleanup {
         fn drop(&mut self) {
@@ -138,16 +150,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let _proxy_guard = SafeProxyCleanup;
-
-    // 2. Setup file logging in %LOCALAPPDATA%\NetFusion\netfusion.log or fallback
-    let log_path = get_app_dir().join("netfusion.log");
-    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-            .target(env_logger::Target::Pipe(Box::new(file)))
-            .try_init();
-    } else {
-        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).try_init();
-    }
 
     info!("Starting NetFusion Windows Internet Bonding Engine v{}", env!("CARGO_PKG_VERSION"));
 
@@ -244,7 +246,8 @@ async fn run_bonding_engine(
         .parse()
         .map_err(|e| format!("Invalid server endpoint {}: {}", config.server_endpoint, e))?;
 
-    // 2. Setup bypass routes and enable Weak Host Model across all physical interfaces
+    // 2. Setup bypass routes, purge conflicting routes, and enable Weak Host Model across all physical interfaces
+    route::purge_conflicting_kernel_routes();
     let mut route_mgr = RouteManager::new();
     for wan in &eligible_wans {
         route::enable_weak_host_model(wan.if_index);

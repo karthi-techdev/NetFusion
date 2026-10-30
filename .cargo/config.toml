@@ -1,3 +1,7 @@
+[build]
+target = "x86_64-pc-windows-gnu"
+
 [target.x86_64-pc-windows-gnu]
-linker = "gcc.exe"
-ar = "ar.exe"
+linker = "C:\\mingw64\\bin\\gcc.exe"
+ar = "C:\\mingw64\\bin\\ar.exe"
+rustflags = ["-C", "link-arg=-static-libgcc", "-C", "link-arg=-static"]
