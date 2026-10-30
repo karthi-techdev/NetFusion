@@ -4,7 +4,9 @@ mod tun;
 
 use bytes::Bytes;
 use clap::Parser;
-use log::{error, info, warn};
+use log::info;
+#[cfg(target_os = "linux")]
+use log::{error, warn};
 use nat::NatManager;
 use netfusion_core::config::ServerConfig;
 use netfusion_core::crypto::TunnelCrypto;
@@ -12,11 +14,14 @@ use netfusion_core::protocol::{
     MessageType, PacketHeader, HEADER_LEN,
 };
 use session::{ClientSession, SessionManager};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
+#[cfg(target_os = "linux")]
+use std::net::SocketAddr;
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tun::TunDevice;
 
@@ -56,6 +61,7 @@ async fn run_bonding_server(config: ServerConfig) -> Result<(), Box<dyn std::err
     let tun_ip: Ipv4Addr = config.tun_ip.parse().unwrap_or(Ipv4Addr::new(10, 8, 0, 1));
 
     // 1. Initialize TUN device
+    #[allow(unused_variables)]
     let tun_dev = Arc::new(TunDevice::create(&config.tun_name, tun_ip, config.mtu)?);
 
     // 2. Enable NAT and IPv4 forwarding if on Linux
@@ -87,12 +93,14 @@ async fn run_bonding_server(config: ServerConfig) -> Result<(), Box<dyn std::err
     ));
     session_mgr.insert(default_session.clone());
 
+    #[cfg(target_os = "linux")]
     let global_downlink_seq = Arc::new(AtomicU64::new(1));
 
     // 5. Spawn Inbound UDP Traffic Processing Loop (WAN -> TUN)
     {
         let socket = socket.clone();
         let session_mgr = session_mgr.clone();
+        #[cfg(target_os = "linux")]
         let tun_dev = tun_dev.clone();
 
         tokio::spawn(async move {
@@ -116,9 +124,9 @@ async fn run_bonding_server(config: ServerConfig) -> Result<(), Box<dyn std::err
                                         let ciphertext = &data[HEADER_LEN..];
                                         let aad = &data[..HEADER_LEN];
                                         if let Ok(plaintext) = session.crypto.decrypt(header.path_id, header.seq_num, ciphertext, aad) {
-                                            let ready = session.reorder_buf.lock().push(header.seq_num, Bytes::from(plaintext));
+                                            let _ready = session.reorder_buf.lock().push(header.seq_num, Bytes::from(plaintext));
                                             #[cfg(target_os = "linux")]
-                                            for pkt in ready {
+                                            for pkt in _ready {
                                                 let _ = tun_dev.write_packet(&pkt).await;
                                             }
                                         }
@@ -136,7 +144,7 @@ async fn run_bonding_server(config: ServerConfig) -> Result<(), Box<dyn std::err
                             }
                         }
                     }
-                    Err(e) => {
+                    Err(_e) => {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }

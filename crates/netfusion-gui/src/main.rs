@@ -1,6 +1,6 @@
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
-use netfusion_core::metrics::{EngineMetricsSnapshot, PathSnapshot};
+use netfusion_core::metrics::EngineMetricsSnapshot;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;

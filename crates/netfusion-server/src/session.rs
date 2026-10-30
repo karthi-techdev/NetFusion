@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use netfusion_core::crypto::TunnelCrypto;
 use netfusion_core::reorder::ReorderBuffer;
 use netfusion_core::scheduler::{AdaptiveScheduler, PathMetrics};
@@ -56,6 +55,7 @@ impl ClientSession {
     }
 
     /// Select optimal downlink WAN path to send a return packet of size `len`
+    #[allow(dead_code)]
     pub fn select_downlink_path(&self, len: usize) -> Option<(u8, SocketAddr)> {
         let mut sched = self.scheduler.write();
         if let Some(path_id) = sched.select_path(len) {
@@ -93,6 +93,7 @@ impl SessionManager {
         self.sessions_by_id.read().get(&session_id).cloned()
     }
 
+    #[allow(dead_code)]
     pub fn get_by_ip(&self, ip: &Ipv4Addr) -> Option<Arc<ClientSession>> {
         self.sessions_by_ip.read().get(ip).cloned()
     }

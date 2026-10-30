@@ -1,10 +1,14 @@
-use log::{error, info, warn};
+use log::info;
+#[cfg(target_os = "linux")]
+use log::{error, warn};
 use std::net::Ipv4Addr;
+#[cfg(target_os = "linux")]
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
+#[allow(dead_code)]
 pub struct TunDevice {
     pub name: String,
     pub ip: Ipv4Addr,
