@@ -1,0 +1,18 @@
+[package]
+name = "netfusion-gui"
+version = "0.1.0"
+edition = "2021"
+authors = ["NetFusion Engineering Team"]
+description = "Lightweight native Windows dashboard for NetFusion bonding engine"
+
+[dependencies]
+netfusion-core = { path = "../netfusion-core" }
+eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow"] }
+egui_plot = "0.27"
+tokio = { version = "1.37", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+env_logger = "0.11"
+sysinfo = "0.30"
+parking_lot = "0.12"

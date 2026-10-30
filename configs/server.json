@@ -1,0 +1,10 @@
+{
+  "listen_port": 51820,
+  "auth_token": "netfusion-secure-pre-shared-token-2026",
+  "encryption_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "tun_ip": "10.8.0.1",
+  "tun_name": "nf-tun0",
+  "mtu": 1420,
+  "enable_nat": true,
+  "reorder_timeout_ms": 15
+}

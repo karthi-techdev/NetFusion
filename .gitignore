@@ -1,0 +1,29 @@
+# Rust build outputs
+/target/
+**/*.rs.bk
+
+# Compiled Executables & Deliverables (Uploaded to GitHub Releases)
+*.exe
+NetFusion-Setup.exe
+netfusion.log
+netfusion_err.log
+
+# Temporary and Log files
+*.log
+*.tmp
+*.bak
+
+# Environment and Secrets
+*.env
+*.key
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Generated
+Thumbs.db
+Desktop.ini
+.DS_Store

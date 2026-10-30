@@ -1,0 +1,45 @@
+[package]
+name = "netfusion-client"
+version = "0.1.0"
+edition = "2021"
+authors = ["NetFusion Engineering Team"]
+description = "Native Windows bonding client, Wintun adapter manager, multi-WAN socket engine, and service"
+
+[[bin]]
+name = "NetFusion"
+path = "src/main.rs"
+
+[dependencies]
+netfusion-core = { path = "../netfusion-core" }
+tokio = { version = "1.37", features = ["full"] }
+socket2 = { version = "0.5", features = ["all"] }
+wintun = "0.5"
+bytes = "1.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+parking_lot = "0.12"
+sysinfo = "0.30"
+windows-service = "0.7"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_IO",
+    "Win32_System_Services",
+    "Win32_Security",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_Networking_WinInet",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_NetworkManagement_WiFi",
+] }

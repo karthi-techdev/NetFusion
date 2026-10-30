@@ -1,0 +1,27 @@
+{
+  "server_endpoint": "203.0.113.50:51820",
+  "auth_token": "netfusion-secure-pre-shared-token-2026",
+  "encryption_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "bonding_mode": "AdaptiveWeighted",
+  "auto_discover_interfaces": true,
+  "interface_overrides": [
+    {
+      "name": "WiFi",
+      "weight": 4.0,
+      "disabled": false
+    },
+    {
+      "name": "Ethernet",
+      "weight": 1.0,
+      "disabled": false
+    }
+  ],
+  "mtu": 1420,
+  "virtual_ip": "10.8.0.2",
+  "dns_servers": [
+    "1.1.1.1",
+    "8.8.8.8"
+  ],
+  "reorder_timeout_ms": 15,
+  "ipc_port": 53921
+}
