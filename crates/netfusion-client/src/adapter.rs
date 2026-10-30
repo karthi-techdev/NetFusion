@@ -193,9 +193,7 @@ pub fn discover_adapters() -> Result<Vec<NetworkInterface>, String> {
             "Direct / Link-Local".to_string()
         };
 
-        // Determine human-friendly network/Wi-Fi name dynamically:
-        // Reads DhcpNetworkHint from Windows TCP/IP registry for this specific interface GUID
-        // and cross-references with active NetworkListManager connection profiles.
+        // Pass 1: Query hardware hint for this specific interface GUID
         let hint_opt = get_adapter_network_hint(&guid);
         let network_name = if let Some(ref hint) = hint_opt {
             if let Some(p) = network_profiles.iter().find(|p| {
@@ -206,27 +204,7 @@ pub fn discover_adapters() -> Result<Vec<NetworkInterface>, String> {
                 hint.clone()
             }
         } else {
-            match kind {
-                AdapterKind::WiFi => {
-                    if let Some(ref ssid) = wifi_ssid {
-                        ssid.clone()
-                    } else if !network_profiles.is_empty() {
-                        network_profiles.first().cloned().unwrap_or_else(|| name.clone())
-                    } else {
-                        name.clone()
-                    }
-                }
-                AdapterKind::Ethernet => {
-                    if network_profiles.len() > 1 {
-                        network_profiles[1].clone()
-                    } else if !network_profiles.is_empty() {
-                        network_profiles.first().cloned().unwrap_or_else(|| name.clone())
-                    } else {
-                        name.clone()
-                    }
-                }
-                _ => name.clone(),
-            }
+            String::new()
         };
 
         interfaces.push(NetworkInterface {
@@ -246,20 +224,61 @@ pub fn discover_adapters() -> Result<Vec<NetworkInterface>, String> {
         curr_ptr = adapter.Next;
     }
 
-    // Dynamic second pass: ensure each distinct WAN interface receives a unique active network profile
-    let mut assigned_profiles = std::collections::HashSet::new();
+    // Pass 2: Claiming and mutual-exclusion allocation of active network profiles
+    let mut claimed_profiles = std::collections::HashSet::new();
     for iface in &interfaces {
-        if !iface.network_name.is_empty() && iface.network_name != iface.name {
-            assigned_profiles.insert(iface.network_name.clone());
+        if !iface.network_name.is_empty() {
+            claimed_profiles.insert(iface.network_name.clone());
         }
     }
 
+    // For any Wi-Fi interface without a claimed profile, check WLAN SSID or Wi-Fi profile keywords
     for iface in &mut interfaces {
-        if iface.is_eligible_wan() && (iface.network_name.is_empty() || iface.network_name == iface.name) {
-            if let Some(unassigned) = network_profiles.iter().find(|p| !assigned_profiles.contains(*p)) {
-                iface.network_name = unassigned.clone();
-                assigned_profiles.insert(unassigned.clone());
+        if iface.is_eligible_wan() && iface.kind == AdapterKind::WiFi && iface.network_name.is_empty() {
+            if let Some(ref ssid) = wifi_ssid {
+                if let Some(p) = network_profiles.iter().find(|p| !claimed_profiles.contains(*p) && (p.to_lowercase().contains(&ssid.to_lowercase()) || ssid.to_lowercase().contains(&p.to_lowercase()))) {
+                    iface.network_name = p.clone();
+                    claimed_profiles.insert(p.clone());
+                } else {
+                    iface.network_name = ssid.clone();
+                }
+            } else if let Some(p) = network_profiles.iter().find(|p| !claimed_profiles.contains(*p) && (p.to_lowercase().contains("wifi") || p.to_lowercase().contains("wlan") || p.to_lowercase().contains("ghz"))) {
+                iface.network_name = p.clone();
+                claimed_profiles.insert(p.clone());
             }
+        }
+    }
+
+    // For any remaining eligible WAN interface (such as Ethernet) without a profile, assign from remaining unclaimed profiles
+    for iface in &mut interfaces {
+        if iface.is_eligible_wan() && iface.network_name.is_empty() {
+            if let Some(unassigned) = network_profiles.iter().find(|p| !claimed_profiles.contains(*p)) {
+                iface.network_name = unassigned.clone();
+                claimed_profiles.insert(unassigned.clone());
+            }
+        }
+    }
+
+    // Strict Anti-Collision Pass: If two distinct active WAN interfaces ended up with the same profile name,
+    // reassign the second one to an unused active profile so they never show duplicate names
+    let mut seen_names = std::collections::HashSet::new();
+    for iface in &mut interfaces {
+        if iface.is_eligible_wan() && !iface.network_name.is_empty() {
+            if seen_names.contains(&iface.network_name) {
+                if let Some(unassigned) = network_profiles.iter().find(|p| !claimed_profiles.contains(*p)) {
+                    iface.network_name = unassigned.clone();
+                    claimed_profiles.insert(unassigned.clone());
+                }
+            } else {
+                seen_names.insert(iface.network_name.clone());
+            }
+        }
+    }
+
+    // Final fallback: If an interface still has no network name, use its friendly adapter name
+    for iface in &mut interfaces {
+        if iface.network_name.is_empty() {
+            iface.network_name = iface.name.clone();
         }
     }
 

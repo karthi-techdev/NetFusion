@@ -44,10 +44,23 @@ struct CliArgs {
 
     #[arg(long)]
     watchdog: Option<u32>,
+
+    #[arg(long)]
+    dump_adapters: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = CliArgs::parse();
+
+    if args.dump_adapters {
+        let adapters = adapter::discover_adapters()?;
+        for a in adapters {
+            if a.is_eligible_wan() {
+                println!("[WAN] {:?} | Name: '{}' | Network: '{}' | IP: {:?}", a.kind, a.name, a.network_name, a.ipv4_addr);
+            }
+        }
+        return Ok(());
+    }
 
     // Watchdog mode: lightweight detached process that monitors parent NetFusion PID.
     // If NetFusion exits, panics, crashes, or is killed by Task Manager, this watchdog
