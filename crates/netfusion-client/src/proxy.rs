@@ -349,23 +349,56 @@ async fn try_wan_connect(
     // If the target is IPv6-only or has IPv6 candidates, IPv6 is still tried with a fast timeout.
     candidates.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
 
-    for remote in candidates {
-        let connect_timeout = if remote.is_ipv6() {
+    if candidates.len() == 1 {
+        let remote = candidates[0];
+        let timeout_dur = if remote.is_ipv6() {
             std::time::Duration::from_millis(350)
         } else {
-            std::time::Duration::from_millis(1500)
+            std::time::Duration::from_millis(800)
         };
-
-        match tokio::time::timeout(
-            connect_timeout,
+        return match tokio::time::timeout(
+            timeout_dur,
             bind_and_connect(wan.ipv4, wan.ipv6, wan.if_index, remote),
         ).await {
-            Ok(Ok(stream)) => return Ok(stream),
-            _ => continue,
+            Ok(Ok(stream)) => Ok(stream),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Single candidate connect timeout")),
+        };
+    }
+
+    // RFC 8305 Happy Eyeballs: Staggered parallel connection racing
+    // Tries candidate 0 immediately; if not connected in 150ms, starts candidate 1 in parallel.
+    // Whichever establishes first wins instantly and cancels remaining attempts!
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for (i, remote) in candidates.into_iter().enumerate() {
+        let wan_ipv4 = wan.ipv4;
+        let wan_ipv6 = wan.ipv6;
+        let if_index = wan.if_index;
+        let timeout_dur = if remote.is_ipv6() {
+            std::time::Duration::from_millis(350)
+        } else {
+            std::time::Duration::from_millis(1000)
+        };
+        let delay_ms = (i as u64) * 150;
+
+        join_set.spawn(async move {
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            tokio::time::timeout(
+                timeout_dur,
+                bind_and_connect(wan_ipv4, wan_ipv6, if_index, remote),
+            ).await
+        });
+    }
+
+    while let Some(res) = join_set.join_next().await {
+        if let Ok(Ok(Ok(stream))) = res {
+            return Ok(stream);
         }
     }
 
-    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Interface connect failed"))
+    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "All candidates failed to connect"))
 }
 
 /// Ultra-high performance lock-free zero-contention bidirectional stream splicer.
