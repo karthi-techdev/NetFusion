@@ -1,4 +1,4 @@
-use log::{error, info, warn};
+use log::{info, warn};
 use netfusion_core::metrics::EngineMetricsSnapshot;
 use parking_lot::RwLock;
 use std::os::windows::ffi::OsStrExt;
@@ -427,7 +427,7 @@ fn handle_menu_command(cmd_id: usize) {
                         if let Ok(mut stream) = TcpStream::connect("127.0.0.1:8080") {
                             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
                             let req = format!(
-                                "GET http://{}{} HTTP/1.1\r\nHost: {}\r\nUser-Agent: NetFusion-BondingEngine\r\nConnection: close\r\n\r\n",
+                                "GET http://{}{} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) NetFusion/1.0\r\nConnection: close\r\n\r\n",
                                 host, path, host
                             );
                             let _ = stream.write_all(req.as_bytes());

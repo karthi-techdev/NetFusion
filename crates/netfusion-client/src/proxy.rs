@@ -331,55 +331,60 @@ async fn try_wan_connect(
     wan: &WanInterfaceInfo,
     target_addrs: &[SocketAddr],
 ) -> std::io::Result<TcpStream> {
-    // Filter candidates according to WAN interface capabilities
-    let mut candidates: Vec<SocketAddr> = target_addrs
-        .iter()
-        .copied()
-        .filter(|a| {
-            (a.is_ipv4() && wan.ipv4.is_some()) || (a.is_ipv6() && wan.ipv6.is_some())
-        })
-        .collect();
+    let mut v4_candidates = Vec::new();
+    let mut v6_candidates = Vec::new();
 
-    if candidates.is_empty() {
-        return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Interface lacks matching IP version"));
+    for &addr in target_addrs {
+        if addr.is_ipv4() && wan.ipv4.is_some() {
+            v4_candidates.push(addr);
+        } else if addr.is_ipv6() && wan.ipv6.is_some() {
+            v6_candidates.push(addr);
+        }
     }
 
-    // High performance connection prioritization:
-    // When dual-stack targets are resolved, prioritize IPv4 for instant (<15ms) zero-latency connect.
-    // If the target is IPv6-only or has IPv6 candidates, IPv6 is still tried with a fast timeout.
-    candidates.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
-
-    if candidates.len() == 1 {
-        let remote = candidates[0];
-        let timeout_dur = if remote.is_ipv6() {
-            std::time::Duration::from_millis(350)
-        } else {
-            std::time::Duration::from_millis(800)
-        };
-        return match tokio::time::timeout(
-            timeout_dur,
-            bind_and_connect(wan.ipv4, wan.ipv6, wan.if_index, remote),
-        ).await {
-            Ok(Ok(stream)) => Ok(stream),
-            _ => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Single candidate connect timeout")),
-        };
+    if v4_candidates.is_empty() && v6_candidates.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Interface lacks matching IP version for target",
+        ));
     }
 
-    // RFC 8305 Happy Eyeballs: Staggered parallel connection racing
-    // Tries candidate 0 immediately; if not connected in 150ms, starts candidate 1 in parallel.
-    // Whichever establishes first wins instantly and cancels remaining attempts!
+    // High performance RFC 8305 Happy Eyeballs with interface-resilient fallback:
+    // If interface has working IPv6, give IPv6 priority with a fast 200ms head start.
+    // If IPv6 establishes, native IPv6 is used strictly!
+    // If IPv6 doesn't establish within 200ms or fails, IPv4 is raced immediately on the SAME interface.
+    // This guarantees interfaces without working IPv6 routes (like unroutable local RA) NEVER fail
+    // or falsely dump their connections onto other interfaces!
     let mut join_set = tokio::task::JoinSet::new();
 
-    for (i, remote) in candidates.into_iter().enumerate() {
+    let mut attempt_order = Vec::new();
+    if !v6_candidates.is_empty() && !v4_candidates.is_empty() {
+        // Dual-stack target: Try primary IPv6 immediately, and schedule primary IPv4 after 200ms
+        attempt_order.push((v6_candidates[0], 0u64, std::time::Duration::from_millis(600)));
+        attempt_order.push((v4_candidates[0], 200u64, std::time::Duration::from_millis(3500)));
+        // Add secondary candidates if present
+        for &v4 in v4_candidates.iter().skip(1) {
+            attempt_order.push((v4, 400u64, std::time::Duration::from_millis(3500)));
+        }
+        for &v6 in v6_candidates.iter().skip(1) {
+            attempt_order.push((v6, 400u64, std::time::Duration::from_millis(800)));
+        }
+    } else if !v4_candidates.is_empty() {
+        // IPv4-only target: Race IPv4 candidates with 3.5s timeout
+        for (i, &v4) in v4_candidates.iter().enumerate() {
+            attempt_order.push((v4, (i as u64) * 150, std::time::Duration::from_millis(3500)));
+        }
+    } else {
+        // IPv6-only target
+        for (i, &v6) in v6_candidates.iter().enumerate() {
+            attempt_order.push((v6, (i as u64) * 150, std::time::Duration::from_millis(1500)));
+        }
+    }
+
+    for (remote, delay_ms, timeout_dur) in attempt_order {
         let wan_ipv4 = wan.ipv4;
         let wan_ipv6 = wan.ipv6;
         let if_index = wan.if_index;
-        let timeout_dur = if remote.is_ipv6() {
-            std::time::Duration::from_millis(350)
-        } else {
-            std::time::Duration::from_millis(1000)
-        };
-        let delay_ms = (i as u64) * 150;
 
         join_set.spawn(async move {
             if delay_ms > 0 {
@@ -398,7 +403,10 @@ async fn try_wan_connect(
         }
     }
 
-    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "All candidates failed to connect"))
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "All candidates failed to connect on interface",
+    ))
 }
 
 /// Ultra-high performance lock-free zero-contention bidirectional stream splicer.
@@ -426,12 +434,16 @@ async fn splice_bidirectional(
                 }
                 Ok(n) => {
                     if rw.write_all(&buf[..n]).await.is_err() {
+                        let _ = rw.shutdown().await;
                         break;
                     }
                     PROXY_PATH_TX_BYTES[pid].fetch_add(n as u64, Ordering::Relaxed);
                     PROXY_PATH_TX_PACKETS[pid].fetch_add(1, Ordering::Relaxed);
                 }
-                Err(_) => break,
+                Err(_) => {
+                    let _ = rw.shutdown().await;
+                    break;
+                }
             }
         }
     };
@@ -446,20 +458,21 @@ async fn splice_bidirectional(
                 }
                 Ok(n) => {
                     if cw.write_all(&buf[..n]).await.is_err() {
+                        let _ = cw.shutdown().await;
                         break;
                     }
                     PROXY_PATH_RX_BYTES[pid].fetch_add(n as u64, Ordering::Relaxed);
                     PROXY_PATH_RX_PACKETS[pid].fetch_add(1, Ordering::Relaxed);
                 }
-                Err(_) => break,
+                Err(_) => {
+                    let _ = cw.shutdown().await;
+                    break;
+                }
             }
         }
     };
 
-    tokio::select! {
-        _ = client_to_remote => {},
-        _ = remote_to_client => {},
-    }
+    tokio::join!(client_to_remote, remote_to_client);
 }
 
 /// Asynchronously bind a TCP socket strictly to a physical network adapter's local IP and interface index
@@ -554,9 +567,9 @@ async fn bind_and_connect(
             let stream = TcpStream::from_std(std_stream)?;
             let _ = stream.set_nodelay(true);
             let connect_timeout = if remote_addr.is_ipv6() {
-                std::time::Duration::from_millis(350)
+                std::time::Duration::from_millis(800)
             } else {
-                std::time::Duration::from_millis(1500)
+                std::time::Duration::from_millis(3500)
             };
             match tokio::time::timeout(connect_timeout, stream.writable()).await {
                 Ok(Ok(())) => {

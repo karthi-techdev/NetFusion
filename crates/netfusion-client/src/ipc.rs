@@ -12,6 +12,7 @@ pub enum IpcCommand {
     SetBondingMode(String),
     SetInterfaceWeight { name: String, weight: f32 },
     GetStatus,
+    Shutdown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

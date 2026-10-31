@@ -800,6 +800,11 @@ async fn run_bonding_engine(
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => {
                 info!("Received command: {:?}", cmd);
+                if let ipc::IpcCommand::Shutdown = cmd {
+                    info!("IPC shutdown command received. Exiting...");
+                    exit_requested.store(true, Ordering::Relaxed);
+                    break;
+                }
             }
             _ = tokio::time::sleep(Duration::from_millis(500)) => {}
         }
