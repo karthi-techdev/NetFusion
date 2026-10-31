@@ -403,14 +403,14 @@ fn handle_menu_command(cmd_id: usize) {
                 use std::io::{Read, Write};
                 use std::net::TcpStream;
                 let targets = [
-                    ("proof.ovh.net", "/files/10Mb.dat"),
-                    ("speedtest.tele2.net", "/10MB.zip"),
-                    ("proof.ovh.net", "/files/10Mb.dat"),
-                    ("speedtest.tele2.net", "/10MB.zip"),
-                    ("proof.ovh.net", "/files/10Mb.dat"),
-                    ("speedtest.tele2.net", "/10MB.zip"),
-                    ("proof.ovh.net", "/files/10Mb.dat"),
-                    ("speedtest.tele2.net", "/10MB.zip"),
+                    ("speed.cloudflare.com", "/__down?bytes=5000000"),
+                    ("speed.cloudflare.com", "/__down?bytes=5000000"),
+                    ("speed.cloudflare.com", "/__down?bytes=5000000"),
+                    ("speed.cloudflare.com", "/__down?bytes=5000000"),
+                    ("speed.cloudflare.com", "/__down?bytes=5000000"),
+                    ("speed.cloudflare.com", "/__down?bytes=5000000"),
+                    ("speed.cloudflare.com", "/__down?bytes=5000000"),
+                    ("speed.cloudflare.com", "/__down?bytes=5000000"),
                 ];
                 let mut handles = Vec::new();
                 for &(host, path) in &targets {
