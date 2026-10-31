@@ -62,7 +62,7 @@ async fn cached_resolve(host: &str, port: u16) -> Vec<SocketAddr> {
     }
 
     let addrs: Vec<SocketAddr> = match tokio::time::timeout(
-        std::time::Duration::from_millis(2000),
+        std::time::Duration::from_millis(6000),
         tokio::net::lookup_host(&key),
     ).await {
         Ok(Ok(iter)) => iter.collect(),
@@ -199,11 +199,13 @@ async fn handle_client(
 
                     splice_bidirectional(client, remote_stream, active_pid).await;
                 }
-                Err(_) => {
+                Err(e) => {
+                    warn!("CONNECT tunnel failed to {}:{}: {}", target_host, target_port, e);
                     let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                 }
             }
         } else {
+            warn!("No available WAN interface for CONNECT to {}:{}", target_host, target_port);
             let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
         }
     } else {
