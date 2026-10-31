@@ -1,4 +1,4 @@
-use log::{error, info};
+use log::{error, info, warn};
 use netfusion_core::metrics::EngineMetricsSnapshot;
 use parking_lot::RwLock;
 use std::os::windows::ffi::OsStrExt;
@@ -101,7 +101,10 @@ impl SystemTrayApp {
             );
 
             if hwnd == 0 {
-                error!("Failed to create background message window for System Tray");
+                warn!("No interactive desktop window available. Running Bonding Engine in background daemon mode.");
+                while !self.exit_requested.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
                 return;
             }
 
@@ -161,9 +164,15 @@ impl SystemTrayApp {
             let mut msg: MSG = std::mem::zeroed();
             loop {
                 let res = GetMessageW(&mut msg, 0, 0, 0);
-                if res <= 0 {
-                    info!("Tray message pump exited with return value: {}", res);
+                if res == 0 {
+                    info!("Tray message pump received WM_QUIT. Exiting cleanly.");
                     break;
+                }
+                if res < 0 {
+                    let err = windows_sys::Win32::Foundation::GetLastError();
+                    warn!("GetMessageW returned error {}. Retrying...", err);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    continue;
                 }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
