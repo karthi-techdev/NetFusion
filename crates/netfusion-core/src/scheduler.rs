@@ -19,6 +19,9 @@ pub struct PathMetrics {
     pub is_alive: bool,
     pub capacity_weight: f32,
     pub dynamic_credit: f32,
+    pub active_flows: u32,
+    pub is_v4_up: bool,
+    pub is_v6_up: bool,
 }
 
 impl PathMetrics {
@@ -40,6 +43,9 @@ impl PathMetrics {
             is_alive: true,
             capacity_weight: 1.0,
             dynamic_credit: 1.0,
+            active_flows: 0,
+            is_v4_up: true,
+            is_v6_up: false,
         }
     }
 
@@ -131,6 +137,70 @@ impl AdaptiveScheduler {
             for (i, p) in self.paths.iter_mut().enumerate() {
                 p.dynamic_credit = (scores[i] / total_score).max(0.0);
             }
+        }
+    }
+
+    /// Check whether every active IPv4 path also has verified IPv6 internet routing.
+    /// If even one active path lacks working IPv6, returns false so dual-stack destinations
+    /// fall back to IPv4 and utilize all physical adapters evenly without single-adapter funneling.
+    pub fn v6_covers_all(&self) -> bool {
+        let active_wans: Vec<&PathMetrics> = self.paths.iter().filter(|p| p.is_alive).collect();
+        if active_wans.is_empty() {
+            return false;
+        }
+        let any_v6 = active_wans.iter().any(|p| p.is_v6_up);
+        if !any_v6 {
+            return false;
+        }
+        for p in active_wans {
+            if p.is_v4_up && !p.is_v6_up {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Select the next optimal WAN path for a new flow (connection) based on least active flows
+    /// and address family availability.
+    pub fn select_next_flow_path(&mut self, is_v6: bool) -> Option<u8> {
+        let eligible: Vec<usize> = self.paths
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.is_alive && if is_v6 { p.is_v6_up } else { p.is_v4_up })
+            .map(|(i, _)| i)
+            .collect();
+
+        if eligible.is_empty() {
+            // Fallback: any alive path
+            return self.select_next_path();
+        }
+
+        // Find candidate with lowest score: (active_flows + 1) / capacity_weight
+        let mut best_idx = eligible[0];
+        let mut min_score = f32::MAX;
+
+        let start = self.current_index % eligible.len();
+        for offset in 0..eligible.len() {
+            let idx = eligible[(start + offset) % eligible.len()];
+            let p = &self.paths[idx];
+            let weight = if p.capacity_weight > 0.05 { p.capacity_weight } else { 1.0 };
+            let score = ((p.active_flows + 1) as f32) / weight;
+            if score < min_score {
+                min_score = score;
+                best_idx = idx;
+            }
+        }
+
+        self.current_index = (self.current_index + 1) % self.paths.len();
+        self.paths[best_idx].active_flows += 1;
+        self.paths[best_idx].tx_packets += 1;
+        Some(self.paths[best_idx].path_id)
+    }
+
+    /// Release an active flow on a path when connection closes
+    pub fn release_flow(&mut self, path_id: u8) {
+        if let Some(p) = self.paths.iter_mut().find(|p| p.path_id == path_id) {
+            p.active_flows = p.active_flows.saturating_sub(1);
         }
     }
 
@@ -237,5 +307,55 @@ mod tests {
             counts[0],
             counts[1]
         );
+    }
+
+    #[test]
+    fn test_v6_covers_all_asymmetry_detection() {
+        let mut sched = AdaptiveScheduler::new(1500.0);
+
+        // Path 0: Ethernet (v4 up, v6 down)
+        let mut p0 = PathMetrics::new(0, "Ethernet".to_string(), "192.168.29.7".to_string());
+        p0.is_v4_up = true;
+        p0.is_v6_up = false;
+        sched.add_path(p0);
+
+        // Path 1: WiFi (v4 up, v6 up)
+        let mut p1 = PathMetrics::new(1, "WiFi".to_string(), "192.168.29.224".to_string());
+        p1.is_v4_up = true;
+        p1.is_v6_up = true;
+        sched.add_path(p1);
+
+        // Crucial test: V6 does NOT cover all adapters!
+        assert!(!sched.v6_covers_all(), "When Ethernet lacks working IPv6, v6_covers_all must be false");
+
+        // When Ethernet IPv6 is fixed, v6_covers_all becomes true!
+        sched.paths_mut()[0].is_v6_up = true;
+        assert!(sched.v6_covers_all(), "When all adapters have IPv6, v6_covers_all must be true");
+    }
+
+    #[test]
+    fn test_least_active_flows_balanced_distribution() {
+        let mut sched = AdaptiveScheduler::new(1500.0);
+
+        let mut p0 = PathMetrics::new(0, "Ethernet".to_string(), "192.168.29.7".to_string());
+        p0.is_v4_up = true;
+        sched.add_path(p0);
+
+        let mut p1 = PathMetrics::new(1, "WiFi".to_string(), "192.168.29.224".to_string());
+        p1.is_v4_up = true;
+        sched.add_path(p1);
+
+        // Flow 1 -> Path 0
+        let f1 = sched.select_next_flow_path(false).unwrap();
+        // Flow 2 -> Path 1 (Path 0 is busy with f1)
+        let f2 = sched.select_next_flow_path(false).unwrap();
+        assert_ne!(f1, f2, "Concurrent flows must be distributed to different adapters");
+
+        // Release flow 1 on Path 0
+        sched.release_flow(f1);
+
+        // Flow 3 should now pick Path 0 because Path 1 is still busy with f2!
+        let f3 = sched.select_next_flow_path(false).unwrap();
+        assert_eq!(f3, f1, "New flow must be assigned to the idle adapter");
     }
 }

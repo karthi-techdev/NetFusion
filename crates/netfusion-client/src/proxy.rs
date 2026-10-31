@@ -44,12 +44,12 @@ struct DnsEntry {
 }
 static DNS_CACHE: RwLock<Option<HashMap<String, DnsEntry>>> = RwLock::new(None);
 
-async fn cached_resolve(host: &str, port: u16) -> Vec<SocketAddr> {
+async fn cached_resolve(host: &str, port: u16, v6_covers_all: bool) -> Vec<SocketAddr> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return vec![SocketAddr::new(ip, port)];
     }
 
-    let key = format!("{}:{}", host, port);
+    let key = format!("{}:{}:{}", host, port, v6_covers_all);
     {
         let cache_lock = DNS_CACHE.read();
         if let Some(ref cache) = *cache_lock {
@@ -61,12 +61,28 @@ async fn cached_resolve(host: &str, port: u16) -> Vec<SocketAddr> {
         }
     }
 
-    let addrs: Vec<SocketAddr> = match tokio::time::timeout(
+    let lookup_target = format!("{}:{}", host, port);
+    let raw_addrs: Vec<SocketAddr> = match tokio::time::timeout(
         std::time::Duration::from_millis(6000),
-        tokio::net::lookup_host(&key),
+        tokio::net::lookup_host(&lookup_target),
     ).await {
         Ok(Ok(iter)) => iter.collect(),
         _ => Vec::new(),
+    };
+
+    let addrs: Vec<SocketAddr> = if v6_covers_all {
+        raw_addrs
+    } else {
+        // If not every active adapter has verified IPv6 routing,
+        // filter out IPv6 addresses so dual-stack browsers fall back to IPv4.
+        // Because IPv4 is supported on 100% of adapters, traffic is evenly bonded
+        // across all adapters without single-adapter funneling.
+        let v4_only: Vec<SocketAddr> = raw_addrs.iter().filter(|a| a.is_ipv4()).copied().collect();
+        if v4_only.is_empty() {
+            raw_addrs
+        } else {
+            v4_only
+        }
     };
 
     if !addrs.is_empty() {
@@ -84,7 +100,6 @@ async fn cached_resolve(host: &str, port: u16) -> Vec<SocketAddr> {
     addrs
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct WanInterfaceInfo {
     pub path_id: u8,
@@ -94,6 +109,19 @@ pub struct WanInterfaceInfo {
     pub gateway: Option<Ipv4Addr>,
     pub ipv6_gateway: Option<Ipv6Addr>,
     pub if_index: u32,
+}
+
+/// RAII Guard that automatically tracks and releases active flows on WAN paths
+struct FlowGuard {
+    scheduler: Arc<RwLock<AdaptiveScheduler>>,
+    path_id: u8,
+}
+
+impl Drop for FlowGuard {
+    fn drop(&mut self) {
+        let mut sched = self.scheduler.write();
+        sched.release_flow(self.path_id);
+    }
 }
 
 /// High-performance local Multi-WAN dispatcher proxy
@@ -170,13 +198,16 @@ async fn handle_client(
         }
         let target = parts[1];
         let (target_host, target_port) = parse_host_port(target, 443);
+        let is_target_v6 = target_host.starts_with('[') || target_host.parse::<Ipv6Addr>().is_ok();
 
-        // Select WAN path using fair round-robin alternation across active links
-        let path_id = if is_active {
+        // Select optimal WAN path via least active flows and address family availability
+        let (path_id, v6_covers_all) = if is_active {
             let mut sched = scheduler.write();
-            sched.select_next_path().unwrap_or(0)
+            let covers = sched.v6_covers_all();
+            let pid = sched.select_next_flow_path(is_target_v6).unwrap_or(0);
+            (pid, covers)
         } else {
-            0
+            (0, true)
         };
 
         let target_wan = {
@@ -188,11 +219,16 @@ async fn handle_client(
         };
 
         if let Some(wan) = target_wan {
-            let target_addrs = cached_resolve(&target_host, target_port).await;
+            let target_addrs = cached_resolve(&target_host, target_port, v6_covers_all).await;
             let connect_res = connect_with_failover(&wan, &target_addrs, &wan_interfaces).await;
 
             match connect_res {
                 Ok((remote_stream, active_pid)) => {
+                    let _flow_guard = FlowGuard {
+                        scheduler: scheduler.clone(),
+                        path_id: active_pid,
+                    };
+
                     client
                         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                         .await?;
@@ -220,12 +256,15 @@ async fn handle_client(
 
         if let Some(host) = host_header {
             let (target_host, target_port) = parse_host_port(&host, 80);
+            let is_target_v6 = target_host.starts_with('[') || target_host.parse::<Ipv6Addr>().is_ok();
 
-            let path_id = if is_active {
+            let (path_id, v6_covers_all) = if is_active {
                 let mut sched = scheduler.write();
-                sched.select_next_path().unwrap_or(0)
+                let covers = sched.v6_covers_all();
+                let pid = sched.select_next_flow_path(is_target_v6).unwrap_or(0);
+                (pid, covers)
             } else {
-                0
+                (0, true)
             };
 
             let target_wan = {
@@ -237,25 +276,36 @@ async fn handle_client(
             };
 
             if let Some(wan) = target_wan {
-                let target_addrs = cached_resolve(&target_host, target_port).await;
+                let target_addrs = cached_resolve(&target_host, target_port, v6_covers_all).await;
                 let connect_res = connect_with_failover(&wan, &target_addrs, &wan_interfaces).await;
 
                 if let Ok((mut remote_stream, active_pid)) = connect_res {
+                    let _flow_guard = FlowGuard {
+                        scheduler: scheduler.clone(),
+                        path_id: active_pid,
+                    };
+
                     let payload = if first_line.contains(" http://") {
                         let parts: Vec<&str> = first_line.split_whitespace().collect();
                         if parts.len() >= 3 {
                             let method = parts[0];
                             let uri = parts[1];
                             let version = parts[2];
-                            if let Some(slash_idx) = uri[7..].find('/') {
-                                let path = &uri[7 + slash_idx..];
-                                let new_first = format!("{} {} {}\r\n", method, path, version);
-                                let rest = &req_str[first_line.len()..];
-                                let rest = rest.strip_prefix("\r\n").or_else(|| rest.strip_prefix("\n")).unwrap_or(rest);
-                                format!("{}{}", new_first, rest).into_bytes()
+                            let path_and_query = if let Some(stripped) = uri.strip_prefix("http://") {
+                                if let Some(slash) = stripped.find('/') {
+                                    &stripped[slash..]
+                                } else if let Some(q) = stripped.find('?') {
+                                    &stripped[q..]
+                                } else {
+                                    "/"
+                                }
                             } else {
-                                buf[..n].to_vec()
-                            }
+                                "/"
+                            };
+                            let new_first = format!("{} {} {}\r\n", method, path_and_query, version);
+                            let rest = &req_str[first_line.len()..];
+                            let rest = rest.strip_prefix("\r\n").or_else(|| rest.strip_prefix("\n")).unwrap_or(rest);
+                            format!("{}{}", new_first, rest).into_bytes()
                         } else {
                             buf[..n].to_vec()
                         }
@@ -312,16 +362,25 @@ async fn connect_with_failover(
     }
 
     // Try chosen interface first
-    if let Ok(stream) = try_wan_connect(wan, target_addrs).await {
-        return Ok((stream, wan.path_id));
+    match try_wan_connect(wan, target_addrs).await {
+        Ok(stream) => return Ok((stream, wan.path_id)),
+        Err(e) => {
+            info!("Primary WAN Path {} (idx: {}, ip: {:?}) failed to connect: {}", wan.path_id, wan.if_index, wan.ipv4, e);
+        }
     }
 
     // Failover: Try any other available WAN interfaces
     let wans = wan_interfaces.read().clone();
     for alt_wan in &wans {
         if alt_wan.path_id != wan.path_id {
-            if let Ok(stream) = try_wan_connect(alt_wan, target_addrs).await {
-                return Ok((stream, alt_wan.path_id));
+            match try_wan_connect(alt_wan, target_addrs).await {
+                Ok(stream) => {
+                    info!("Failover to WAN Path {} (idx: {}, ip: {:?}) succeeded", alt_wan.path_id, alt_wan.if_index, alt_wan.ipv4);
+                    return Ok((stream, alt_wan.path_id));
+                }
+                Err(e) => {
+                    info!("Alt WAN Path {} (idx: {}, ip: {:?}) failed: {}", alt_wan.path_id, alt_wan.if_index, alt_wan.ipv4, e);
+                }
             }
         }
     }
@@ -333,101 +392,71 @@ async fn try_wan_connect(
     wan: &WanInterfaceInfo,
     target_addrs: &[SocketAddr],
 ) -> std::io::Result<TcpStream> {
-    let mut v4_candidates = Vec::new();
-    let mut v6_candidates = Vec::new();
-
+    let mut candidates = Vec::new();
     for &addr in target_addrs {
         if addr.is_ipv4() && wan.ipv4.is_some() {
-            v4_candidates.push(addr);
+            candidates.push(addr);
         } else if addr.is_ipv6() && wan.ipv6.is_some() {
-            v6_candidates.push(addr);
+            candidates.push(addr);
         }
     }
 
-    if v4_candidates.is_empty() && v6_candidates.is_empty() {
+    if candidates.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "Interface lacks matching IP version for target",
         ));
     }
 
-    // High performance RFC 8305 Happy Eyeballs with interface-resilient fallback:
-    // If interface has working IPv6, give IPv6 priority with a fast 200ms head start.
-    // If IPv6 establishes, native IPv6 is used strictly!
-    // If IPv6 doesn't establish within 200ms or fails, IPv4 is raced immediately on the SAME interface.
-    // This guarantees interfaces without working IPv6 routes (like unroutable local RA) NEVER fail
-    // or falsely dump their connections onto other interfaces!
-    let mut join_set = tokio::task::JoinSet::new();
-
-    let mut attempt_order = Vec::new();
-    if !v6_candidates.is_empty() && !v4_candidates.is_empty() {
-        // Dual-stack target: Try primary IPv6 immediately, and schedule primary IPv4 after 200ms
-        attempt_order.push((v6_candidates[0], 0u64, std::time::Duration::from_millis(600)));
-        attempt_order.push((v4_candidates[0], 200u64, std::time::Duration::from_millis(3500)));
-        // Add secondary candidates if present
-        for &v4 in v4_candidates.iter().skip(1) {
-            attempt_order.push((v4, 400u64, std::time::Duration::from_millis(3500)));
-        }
-        for &v6 in v6_candidates.iter().skip(1) {
-            attempt_order.push((v6, 400u64, std::time::Duration::from_millis(800)));
-        }
-    } else if !v4_candidates.is_empty() {
-        // IPv4-only target: Race IPv4 candidates with 3.5s timeout
-        for (i, &v4) in v4_candidates.iter().enumerate() {
-            attempt_order.push((v4, (i as u64) * 150, std::time::Duration::from_millis(3500)));
-        }
-    } else {
-        // IPv6-only target
-        for (i, &v6) in v6_candidates.iter().enumerate() {
-            attempt_order.push((v6, (i as u64) * 150, std::time::Duration::from_millis(1500)));
-        }
-    }
-
-    for (remote, delay_ms, timeout_dur) in attempt_order {
+    let mut last_err = None;
+    for &remote in &candidates {
         let wan_ipv4 = wan.ipv4;
         let wan_ipv6 = wan.ipv6;
         let if_index = wan.if_index;
 
-        join_set.spawn(async move {
-            if delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            }
-            tokio::time::timeout(
-                timeout_dur,
-                bind_and_connect(wan_ipv4, wan_ipv6, if_index, remote),
-            ).await
-        });
-    }
+        let connect_timeout = if remote.is_ipv6() {
+            std::time::Duration::from_millis(1500)
+        } else {
+            std::time::Duration::from_millis(2500)
+        };
 
-    while let Some(res) = join_set.join_next().await {
-        if let Ok(Ok(Ok(stream))) = res {
-            return Ok(stream);
+        match tokio::time::timeout(
+            connect_timeout,
+            bind_and_connect(wan_ipv4, wan_ipv6, if_index, remote),
+        ).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => {
+                info!("bind_and_connect failed for WAN {} ({:?}) to {}: {}", wan.path_id, wan_ipv4, remote, e);
+                last_err = Some(e);
+            }
+            Err(_) => {
+                info!("bind_and_connect timed out for WAN {} ({:?}) to {}", wan.path_id, wan_ipv4, remote);
+                last_err = Some(std::io::Error::new(std::io::ErrorKind::TimedOut, "Connect timed out"));
+            }
         }
     }
 
-    Err(std::io::Error::new(
-        std::io::ErrorKind::TimedOut,
-        "All candidates failed to connect on interface",
-    ))
+    Err(last_err.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "All candidates failed")))
 }
 
 /// Ultra-high performance lock-free zero-contention bidirectional stream splicer.
-/// Uses 64KB stack buffers, TCP_NODELAY, atomic bandwidth counters, and clean half-close termination.
+/// Implements RFC-compliant full-duplex TCP half-close with owned read/write halves
+/// so downloads never stall and completed streams terminate immediately without hanging.
 async fn splice_bidirectional(
-    mut client: TcpStream,
-    mut remote: TcpStream,
+    client: TcpStream,
+    remote: TcpStream,
     active_pid: u8,
 ) {
     let _ = client.set_nodelay(true);
     let _ = remote.set_nodelay(true);
 
-    let (mut cr, mut cw) = client.split();
-    let (mut rr, mut rw) = remote.split();
+    let (mut cr, mut cw) = client.into_split();
+    let (mut rr, mut rw) = remote.into_split();
 
     let pid = (active_pid as usize).min(15);
 
-    let client_to_remote = async {
-        let mut buf = [0u8; 65536];
+    let client_to_remote = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
         loop {
             match cr.read(&mut buf).await {
                 Ok(0) => {
@@ -448,10 +477,10 @@ async fn splice_bidirectional(
                 }
             }
         }
-    };
+    });
 
-    let remote_to_client = async {
-        let mut buf = [0u8; 65536];
+    let remote_to_client = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
         loop {
             match rr.read(&mut buf).await {
                 Ok(0) => {
@@ -472,13 +501,13 @@ async fn splice_bidirectional(
                 }
             }
         }
-    };
+    });
 
-    tokio::join!(client_to_remote, remote_to_client);
+    let _ = tokio::join!(client_to_remote, remote_to_client);
 }
 
 /// Asynchronously bind a TCP socket strictly to a physical network adapter's local IP and interface index
-/// using Winsock IP_UNICAST_IF / IPV6_UNICAST_IF with TCP_NODELAY.
+/// using Winsock IP_UNICAST_IF / IPV6_UNICAST_IF with TCP_NODELAY and native Windows dynamic autotuning.
 async fn bind_and_connect(
     local_ipv4: Option<Ipv4Addr>,
     local_ipv6: Option<Ipv6Addr>,
@@ -495,12 +524,7 @@ async fn bind_and_connect(
     // 1. Critical for low latency: Disable Nagle's algorithm (TCP_NODELAY)
     let _ = socket.set_nodelay(true);
 
-    // 2. High throughput buffer tuning
-    let _ = socket.set_recv_buffer_size(1024 * 1024);
-    let _ = socket.set_send_buffer_size(1024 * 1024);
-
-    // 3. Force outbound interface selection via IP_UNICAST_IF / IPV6_UNICAST_IF on Windows
-    // MUST BE CALLED BEFORE BIND SO WINSOCK ALIGNS ROUTING AND EPHEMERAL PORT SELECTION!
+    // 2. Force outbound interface selection via IP_UNICAST_IF / IPV6_UNICAST_IF on Windows
     if if_index > 0 {
         unsafe {
             match remote_addr {
@@ -528,7 +552,7 @@ async fn bind_and_connect(
         }
     }
 
-    // 4. Bind to source interface address
+    // 3. Bind to source interface address
     match remote_addr {
         SocketAddr::V4(_) => {
             let bind_addr = local_ipv4
@@ -563,29 +587,145 @@ async fn bind_and_connect(
             if err.raw_os_error() == Some(10035) // WSAEWOULDBLOCK
                 || err.kind() == std::io::ErrorKind::WouldBlock =>
         {
+            let raw_sock = socket.as_raw_socket() as usize;
+            let timeout_ms: u32 = if remote_addr.is_ipv6() { 1500 } else { 2500 };
+
+            // On Windows, non-blocking connect does NOT generate IOCP completion events.
+            // Winsock select() must be used to reliably wait for FD_CONNECT completion in milliseconds.
+            let wait_res = tokio::task::spawn_blocking(move || {
+                unsafe {
+                    use windows_sys::Win32::Networking::WinSock::{
+                        getsockopt, select, FD_SET, TIMEVAL, SOL_SOCKET, SO_ERROR,
+                    };
+                    let mut write_fds: FD_SET = std::mem::zeroed();
+                    write_fds.fd_count = 1;
+                    write_fds.fd_array[0] = raw_sock;
+
+                    let mut except_fds: FD_SET = std::mem::zeroed();
+                    except_fds.fd_count = 1;
+                    except_fds.fd_array[0] = raw_sock;
+
+                    let tv = TIMEVAL {
+                        tv_sec: (timeout_ms / 1000) as i32,
+                        tv_usec: ((timeout_ms % 1000) * 1000) as i32,
+                    };
+
+                    let sel = select(0, std::ptr::null_mut(), &mut write_fds, &mut except_fds, &tv);
+                    if sel <= 0 {
+                        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "TCP connect timeout"));
+                    }
+
+                    let mut err_code: i32 = 0;
+                    let mut err_len = std::mem::size_of::<i32>() as i32;
+                    getsockopt(
+                        raw_sock as _,
+                        SOL_SOCKET,
+                        SO_ERROR,
+                        &mut err_code as *mut _ as *mut u8,
+                        &mut err_len,
+                    );
+
+                    if err_code != 0 {
+                        return Err(std::io::Error::from_raw_os_error(err_code));
+                    }
+
+                    Ok(())
+                }
+            }).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+            wait_res?;
+
             let std_stream: std::net::TcpStream =
                 unsafe { std::net::TcpStream::from_raw_socket(socket.as_raw_socket() as _) };
             std::mem::forget(socket);
             let stream = TcpStream::from_std(std_stream)?;
             let _ = stream.set_nodelay(true);
-            let connect_timeout = if remote_addr.is_ipv6() {
-                std::time::Duration::from_millis(800)
-            } else {
-                std::time::Duration::from_millis(3500)
-            };
-            match tokio::time::timeout(connect_timeout, stream.writable()).await {
-                Ok(Ok(())) => {
-                    if let Some(e) = stream.take_error()? {
-                        return Err(e);
-                    }
-                    Ok(stream)
-                }
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "TCP connect timeout")),
-            }
+            Ok(stream)
         }
         Err(err) => Err(err),
     }
+}
+
+/// Spawns the background link reachability prober.
+/// Periodically verifies IPv4 and IPv6 internet routing on each adapter
+/// to ensure that asymmetric IPv6 cannot funnel traffic to a single interface.
+pub fn spawn_link_prober(
+    wan_interfaces: Arc<RwLock<Vec<WanInterfaceInfo>>>,
+    scheduler: Arc<RwLock<AdaptiveScheduler>>,
+) {
+    tokio::spawn(async move {
+        // Immediate first probe on startup
+        probe_all_wans(&wan_interfaces, &scheduler).await;
+
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            probe_all_wans(&wan_interfaces, &scheduler).await;
+        }
+    });
+}
+
+async fn probe_all_wans(
+    wan_interfaces: &Arc<RwLock<Vec<WanInterfaceInfo>>>,
+    scheduler: &Arc<RwLock<AdaptiveScheduler>>,
+) {
+    let wans = wan_interfaces.read().clone();
+    for wan in wans {
+        let wan_v4 = wan.ipv4;
+        let wan_v6 = wan.ipv6;
+        let if_idx = wan.if_index;
+        let pid = wan.path_id;
+
+        let v4_up = if wan_v4.is_some() {
+            probe_target_v4(wan_v4, if_idx, "1.1.1.1:443").await
+                || probe_target_v4(wan_v4, if_idx, "8.8.8.8:443").await
+        } else {
+            false
+        };
+
+        let v6_up = if wan_v6.is_some() {
+            probe_target_v6(wan_v6, if_idx, "[2606:4700:4700::1111]:443").await
+                || probe_target_v6(wan_v6, if_idx, "[2001:4860:4860::8888]:443").await
+        } else {
+            false
+        };
+
+        {
+            let mut sched = scheduler.write();
+            if let Some(p) = sched.paths_mut().iter_mut().find(|p| p.path_id == pid) {
+                p.is_v4_up = v4_up;
+                p.is_v6_up = v6_up;
+            }
+        }
+    }
+}
+
+async fn probe_target_v4(local_ip: Option<Ipv4Addr>, if_index: u32, target: &str) -> bool {
+    let remote: SocketAddr = match target.parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_millis(2000),
+        bind_and_connect(local_ip, None, if_index, remote),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false)
+}
+
+async fn probe_target_v6(local_ip: Option<Ipv6Addr>, if_index: u32, target: &str) -> bool {
+    let remote: SocketAddr = match target.parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_millis(2000),
+        bind_and_connect(None, local_ip, if_index, remote),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false)
 }
 
 /// Enable Windows system proxy for 127.0.0.1:8080 and refresh WinINet via native Win32 APIs (no cmd flicker)

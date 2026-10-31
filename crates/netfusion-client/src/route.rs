@@ -215,10 +215,10 @@ pub fn setup_multipath_routing(wans: &[crate::adapter::NetworkInterface]) {
     let mut configured_indices = Vec::new();
     let eligible_indices: std::collections::HashSet<u32> = eligible.iter().map(|w| w.if_index).collect();
 
-    // 1. Enable Weak Host Model & equalize interface metrics on all WAN adapters
+    // 1. Configure Strong Host Model & equalize interface metrics on all WAN adapters
     for wan in &eligible {
         configured_indices.push(wan.if_index);
-        enable_weak_host_model(wan.if_index);
+        configure_strong_host_model(wan.if_index);
 
         // Equalize interface metrics so Windows treats both links with equal priority
         let _ = Command::new("netsh")
@@ -302,9 +302,11 @@ pub fn cleanup_multipath_routing() {
     purge_conflicting_kernel_routes();
 }
 
-/// Enable Weak Host Model on interface to allow sending & receiving through multiple WAN adapters
-/// for both IPv4 and IPv6 protocols
-pub fn enable_weak_host_model(if_index: u32) {
+/// Configure Strong Host Model on WAN interfaces:
+/// Disables weak host send and forwarding so Windows kernel routing strictly respects
+/// IP_UNICAST_IF / IPV6_UNICAST_IF socket binding and prevents traffic from leaking
+/// onto a single default adapter. Enables weak host receive for multi-homing.
+pub fn configure_strong_host_model(if_index: u32) {
     let _ = Command::new("netsh")
         .args([
             "interface",
@@ -312,8 +314,10 @@ pub fn enable_weak_host_model(if_index: u32) {
             "set",
             "interface",
             &if_index.to_string(),
-            "weakhostsend=enabled",
+            "weakhostsend=disabled",
             "weakhostreceive=enabled",
+            "forwarding=disabled",
+            "store=active",
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
@@ -325,11 +329,18 @@ pub fn enable_weak_host_model(if_index: u32) {
             "set",
             "interface",
             &if_index.to_string(),
-            "weakhostsend=enabled",
+            "weakhostsend=disabled",
             "weakhostreceive=enabled",
+            "forwarding=disabled",
+            "store=active",
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
+}
+
+#[allow(dead_code)]
+pub fn enable_weak_host_model(if_index: u32) {
+    configure_strong_host_model(if_index);
 }
 
 /// Purge any lingering /8, /1, /4, /32, or /128 static routes that conflict with Multi-WAN socket binding

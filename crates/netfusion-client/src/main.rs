@@ -305,11 +305,11 @@ async fn run_bonding_engine(
         .parse()
         .map_err(|e| format!("Invalid server endpoint {}: {}", config.server_endpoint, e))?;
 
-    // 2. Setup bypass routes, purge conflicting routes, and enable Weak Host Model across all physical interfaces
+    // 2. Setup bypass routes, purge conflicting routes, and configure Strong Host Model across all physical interfaces
     route::purge_conflicting_kernel_routes();
     let mut route_mgr = RouteManager::new();
     for wan in &eligible_wans {
-        route::enable_weak_host_model(wan.if_index);
+        route::configure_strong_host_model(wan.if_index);
         if let (Some(gw), Some(_)) = (wan.gateway, wan.ipv4_addr) {
             let _ = route_mgr.add_server_bypass_route(*server_sockaddr.ip(), gw, wan.if_index);
         }
@@ -575,6 +575,9 @@ async fn run_bonding_engine(
     // Automatically enable Windows proxy so Chrome, Edge, and Speed tests bond traffic
     proxy::enable_windows_proxy(8080);
 
+    // 10b. Start Dynamic Link Prober to detect IPv4 and IPv6 internet reachability
+    proxy::spawn_link_prober(wan_interfaces.clone(), scheduler.clone());
+
     // 11. System Metrics and Telemetry Broadcast Loop (REAL HARDWARE KERNEL METRICS)
     let _metrics_handle = {
         let scheduler = scheduler.clone();
@@ -648,7 +651,7 @@ async fn run_bonding_engine(
                                     pm.capacity_weight = 1.0;
                                     pm.is_alive = true;
                                     sched_mut.add_path(pm);
-                                    route::enable_weak_host_model(wan.if_index);
+                                    route::configure_strong_host_model(wan.if_index);
                                     info!("Dynamically discovered newly connected network: {} ({:?})", wan.network_name, ip);
                                 }
                             }

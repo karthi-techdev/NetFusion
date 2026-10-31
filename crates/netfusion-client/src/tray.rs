@@ -132,12 +132,17 @@ impl SystemTrayApp {
 
             info!("NetFusion System Tray active with custom icon in Windows Notification Area");
 
-            // Background thread to periodically update tooltip with live throughput
+            // Background thread to periodically update tooltip with live throughput and monitor exit
             let metrics_clone = self.metrics.clone();
             let bonding_active_clone = self.bonding_active.clone();
+            let exit_requested_clone = self.exit_requested.clone();
             std::thread::spawn(move || {
                 loop {
-                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    if exit_requested_clone.load(Ordering::Relaxed) {
+                        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                        break;
+                    }
                     let is_active = bonding_active_clone.load(Ordering::Relaxed);
                     let (comb_rx, path_count) = {
                         let snap = metrics_clone.read();
@@ -277,7 +282,7 @@ unsafe extern "system" fn tray_wnd_proc(
             handle_menu_command(cmd_id);
             0
         }
-        WM_DESTROY => {
+        WM_CLOSE | WM_DESTROY => {
             PostQuitMessage(0);
             0
         }
